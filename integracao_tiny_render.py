@@ -41,8 +41,8 @@ DB_PORT = os.getenv("DB_PORT", "5432") # Geralmente 5432 para PostgreSQL
 # --- Configurações de Robustez ---
 MAX_DB_RECONNECT_ATTEMPTS = 3
 DB_RECONNECT_DELAY_SECONDS = 10
-PAUSA_ENTRE_CHAMADAS_DETALHE = 1.0 # Segundos de pausa após cada chamada de detalhe (produto, vendedor, pedido)
-PAUSA_ENTRE_PAGINAS = 2.0      # Segundos de pausa após processar uma página de listagem
+PAUSA_ENTRE_CHAMADAS_DETALHE = 0.5 # Reduzido para testes, pode precisar aumentar para produção
+PAUSA_ENTRE_PAGINAS = 1.0      # Reduzido para testes, pode precisar aumentar para produção
 
 # Arquivo para guardar o progresso da paginação da carga completa de produtos
 ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS = "ultima_pagina_produto_processada.txt"
@@ -94,7 +94,6 @@ def ler_timestamp_progresso(arquivo_timestamp):
             with open(arquivo_timestamp, "r") as f:
                 timestamp_str = f.read().strip()
                 if timestamp_str:
-                    # Tenta converter para datetime para validar o formato, depois retorna como string dd/mm/yyyy hh:mm:ss
                     dt_obj = datetime.strptime(timestamp_str, "%d/%m/%Y %H:%M:%S")
                     print(f"Timestamp lido de {arquivo_timestamp}: {timestamp_str}")
                     return timestamp_str 
@@ -113,7 +112,6 @@ def salvar_timestamp_progresso(arquivo_timestamp, timestamp_dt_obj):
         print(f"Erro ao salvar timestamp em {arquivo_timestamp}: {e}")
 
 def criar_tabela_categorias(conn):
-    """Cria a tabela 'categorias' se ela não existir."""
     cursor = None
     try:
         conn = garantir_conexao(conn)
@@ -310,7 +308,6 @@ def obter_arvore_categorias_tiny_v2(api_token):
         response = requests.post(endpoint, data=payload, headers=headers, timeout=30)
         response.raise_for_status()
         response_data = response.json()
-
         if isinstance(response_data, list):
             print("API Tiny v2 (categorias): Resposta raiz é uma lista, processando diretamente.")
             return response_data
@@ -319,7 +316,6 @@ def obter_arvore_categorias_tiny_v2(api_token):
             if retorno_geral is None:
                 print(f"API Tiny v2 (categorias): Chave 'retorno' não encontrada na resposta: {response_data}")
                 return None
-
             if isinstance(retorno_geral, list):
                 print("API Tiny v2 (categorias): 'retorno' é uma lista, processando diretamente.")
                 return retorno_geral
@@ -338,7 +334,6 @@ def obter_arvore_categorias_tiny_v2(api_token):
         else:
             print(f"Tipo de resposta raiz inesperado da API Tiny v2 (categorias): {type(response_data)}")
             return None
-
     except requests.exceptions.RequestException as e:
         print(f"Erro de requisição ao buscar árvore de categorias: {e}")
     except requests.exceptions.JSONDecodeError as e:
@@ -353,31 +348,23 @@ def inserir_ou_atualizar_categoria(conn, categoria_node, id_pai=None):
         conn = garantir_conexao(conn)
         if conn is None: return conn, False
         cursor = conn.cursor()
-        
         categoria_id = categoria_node.get("id")
         categoria_nome = categoria_node.get("descricao")
-        
         if not categoria_id or not categoria_nome:
             print(f"AVISO: Categoria com dados incompletos ignorada: {categoria_node}")
-            return conn, True # Considera sucesso para não parar o processo
-
-        # Tenta converter para int, se falhar, loga e ignora
+            return conn, True
         try:
             categoria_id_int = int(categoria_id)
         except ValueError:
             print(f"AVISO: ID de categoria inválido (não numérico) ignorado: {categoria_id}. Nome: {categoria_nome}")
             return conn, True
-
         id_pai_int = None
         if id_pai:
             try:
                 id_pai_int = int(id_pai)
             except ValueError:
                 print(f"AVISO: ID da categoria pai inválido (não numérico) ignorado: {id_pai} para categoria {categoria_nome}")
-                # Não definimos id_pai_int, então será NULL no banco
-        
         print(f"Processando categoria: ID={categoria_id_int}, Nome='{categoria_nome}', PaiID={id_pai_int if id_pai_int else 'N/A'}")
-
         upsert_query = """
         INSERT INTO categorias (id_categoria_tiny, nome_categoria, id_categoria_pai_tiny, data_atualizacao)
         VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
@@ -388,19 +375,14 @@ def inserir_ou_atualizar_categoria(conn, categoria_node, id_pai=None):
             data_atualizacao = CURRENT_TIMESTAMP;
         """
         cursor.execute(upsert_query, (categoria_id_int, categoria_nome, id_pai_int))
-        # conn.commit() # Commit será feito no final da função recursiva principal
-        
-        # Processar filhos recursivamente
         if "filhos" in categoria_node and isinstance(categoria_node["filhos"], list):
             for filho_node in categoria_node["filhos"]:
                 if isinstance(filho_node, dict) and "categoria" in filho_node:
                     conn, success = inserir_ou_atualizar_categoria(conn, filho_node["categoria"], categoria_id_int)
-                    if not success: return conn, False # Propaga o erro
+                    if not success: return conn, False
         return conn, True
-
     except (Exception, psycopg2.Error) as error:
         print(f"Erro ao inserir/atualizar categoria ID {categoria_node.get('id') if categoria_node else 'N/A'}: {error}")
-        # Rollback será feito na função chamadora principal se necessário
         return conn, False
     finally:
         if cursor: cursor.close()
@@ -409,22 +391,20 @@ def buscar_e_gravar_categorias(conn, api_token):
     print("\n--- Iniciando Sincronização de Categorias ---")
     conn = garantir_conexao(conn)
     if conn is None: return conn, False
-
     categorias_tree = obter_arvore_categorias_tiny_v2(api_token)
     if categorias_tree is None:
         print("Não foi possível obter a árvore de categorias. Abortando sincronização de categorias.")
         return conn, False
-
     all_success = True
     if isinstance(categorias_tree, list):
-        for node_wrapper in categorias_tree: # A API v2 pode retornar uma lista de nós raiz encapsulados
+        for node_wrapper in categorias_tree:
             if isinstance(node_wrapper, dict) and "categoria" in node_wrapper:
                 categoria_raiz = node_wrapper["categoria"]
                 conn, success = inserir_ou_atualizar_categoria(conn, categoria_raiz, None)
                 if not success:
                     all_success = False
                     break
-            elif isinstance(node_wrapper, dict) and "id" in node_wrapper and "descricao" in node_wrapper: # Caso a raiz seja a própria categoria
+            elif isinstance(node_wrapper, dict) and "id" in node_wrapper and "descricao" in node_wrapper:
                  conn, success = inserir_ou_atualizar_categoria(conn, node_wrapper, None)
                  if not success:
                     all_success = False
@@ -434,7 +414,6 @@ def buscar_e_gravar_categorias(conn, api_token):
     else:
         print(f"Formato inesperado para a árvore de categorias: {type(categorias_tree)}. Esperado: lista.")
         all_success = False
-
     if all_success:
         try:
             conn.commit()
@@ -449,12 +428,10 @@ def buscar_e_gravar_categorias(conn, api_token):
         try: conn.rollback(); print("Rollback da transação de categorias realizado devido a erros.")
         except psycopg2.Error as rb_error: print(f"Erro no rollback de categorias: {rb_error}")
         return conn, False
-    
-    time.sleep(PAUSA_ENTRE_PAGINAS) # Pausa após processar todas as categorias
+    time.sleep(PAUSA_ENTRE_PAGINAS)
     return conn, True
 
 def ler_progresso_paginacao_produtos():
-    """Lê a última página de produtos processada do arquivo de progresso."""
     try:
         if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
             with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
@@ -466,7 +443,6 @@ def ler_progresso_paginacao_produtos():
     return 1
 
 def salvar_progresso_paginacao_produtos(pagina):
-    """Salva a última página de produtos processada no arquivo de progresso."""
     try:
         with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "w") as f:
             f.write(str(pagina))
@@ -487,34 +463,27 @@ def resetar_progresso_paginacao_produtos():
 def buscar_e_gravar_produtos(conn, api_token):
     print("\n--- Iniciando Sincronização de Produtos ---")
     conn = garantir_conexao(conn)
-    if conn is None: return conn, False, False # conn, sucesso, produtos_restantes
-
+    if conn is None: return conn, False, False
     pagina_atual = ler_progresso_paginacao_produtos()
     produtos_processados_neste_lote = 0
     paginas_processadas_neste_lote = 0
-    todos_produtos_processados_carga_completa = False # Flag para indicar se a carga completa terminou
-
-    # Tenta a busca incremental primeiro
+    todos_produtos_processados_carga_completa = False
     ultimo_timestamp_produtos_str = ler_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS)
-    
     if ultimo_timestamp_produtos_str:
         print(f"Modo incremental para produtos ativado. Buscando alterações desde: {ultimo_timestamp_produtos_str}")
         endpoint_produtos_alteracoes = f"{TINY_API_V2_BASE_URL}/produtos.pesquisar.alteracoes.php"
         payload_base = {"token": api_token, "formato": "json", "dataAlteracao": ultimo_timestamp_produtos_str}
         pagina_api_incremental = 1 
-        
         while True: 
             payload = payload_base.copy()
             if pagina_api_incremental > 1: 
                  payload["pagina"] = pagina_api_incremental
-
             print(f"Buscando produtos alterados (página {pagina_api_incremental}) desde {ultimo_timestamp_produtos_str}...")
             response = None
             try:
                 response = requests.post(endpoint_produtos_alteracoes, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
                 response.raise_for_status()
                 data = response.json()
-
                 if data.get("retorno", {}).get("status") == "Erro":
                     erros = data.get("retorno", {}).get("erros", [])
                     codigo_erro = None
@@ -525,14 +494,12 @@ def buscar_e_gravar_produtos(conn, api_token):
                     elif isinstance(erros, str): 
                         if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower():
                             codigo_erro = "22"
-                    
                     if codigo_erro == "22": 
                         print("API de alterações de produtos: Nenhuma página adicional encontrada (Erro 22).")
                         break 
                     else:
                         print(f"Erro da API Tiny ao buscar produtos alterados: {erros}")
                         return conn, False, True 
-
                 produtos_alterados = data.get("retorno", {}).get("produtos", [])
                 if not produtos_alterados and pagina_api_incremental == 1:
                     print("Nenhum produto alterado encontrado desde o último timestamp.")
@@ -541,8 +508,8 @@ def buscar_e_gravar_produtos(conn, api_token):
                 if not produtos_alterados:
                     print("Fim da lista de produtos alterados (página vazia).")
                     break 
-
                 print(f"Encontrados {len(produtos_alterados)} produtos alterados na página {pagina_api_incremental}.")
+                commit_needed_for_page = False
                 for produto_wrapper in produtos_alterados:
                     produto_data = produto_wrapper.get("produto")
                     if not produto_data or not produto_data.get("id"):
@@ -553,12 +520,18 @@ def buscar_e_gravar_produtos(conn, api_token):
                         print(f"Falha ao processar detalhe do produto alterado ID {produto_data['id']}. Continuando...")
                     else:
                         produtos_processados_neste_lote += 1
-                
-                conn.commit() 
-                print(f"Commit realizado para produtos alterados da página {pagina_api_incremental}.")
+                        commit_needed_for_page = True
+                if commit_needed_for_page:
+                    try:
+                        conn.commit() 
+                        print(f"Commit realizado para produtos alterados da página {pagina_api_incremental}.")
+                    except psycopg2.Error as e:
+                        print(f"Erro ao commitar produtos alterados da página {pagina_api_incremental}: {e}. Tentando rollback...")
+                        try: conn.rollback()
+                        except psycopg2.Error as rb_err: print(f"Erro no rollback: {rb_err}")
+                        return conn, False, True # Indica falha e que há produtos restantes (para tentar de novo)
                 time.sleep(PAUSA_ENTRE_PAGINAS)
                 pagina_api_incremental += 1
-
             except requests.exceptions.RequestException as e:
                 print(f"Erro de requisição ao buscar produtos alterados: {e}")
                 return conn, False, True
@@ -571,32 +544,24 @@ def buscar_e_gravar_produtos(conn, api_token):
                     try: conn.rollback(); print("Rollback da transação de produtos alterados realizado.")
                     except psycopg2.Error as rb_error: print(f"Erro no rollback de produtos alterados: {rb_error}")
                 return conn, False, True
-        
         salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
         print("Sincronização incremental de produtos concluída.")
         resetar_progresso_paginacao_produtos() 
         return conn, True, False 
-
-    # Se não há timestamp, executa a carga completa em lotes
     print(f"Modo de carga completa para produtos ativado. Iniciando da página {pagina_atual} com termo '{TERMO_PESQUISA_PRODUTOS_CARGA_COMPLETA}'.")
-    # CORREÇÃO: Endpoint alterado para produtos.pesquisa.php
     endpoint_produtos_lista_completa = f"{TINY_API_V2_BASE_URL}/produtos.pesquisa.php"
-    
     while paginas_processadas_neste_lote < PAGINAS_POR_LOTE_PRODUTOS:
         print(f"Buscando lista de produtos (página {pagina_atual})...")
-        # CORREÇÃO: Adicionado parâmetro 'pesquisa' obrigatório
         payload = {"token": api_token, "formato": "json", "pesquisa": TERMO_PESQUISA_PRODUTOS_CARGA_COMPLETA, "pagina": pagina_atual}
         response = None
         try:
             response = requests.post(endpoint_produtos_lista_completa, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
             response.raise_for_status()
             data = response.json()
-
             if data.get("retorno", {}).get("status") == "Erro":
                 erros = data.get("retorno", {}).get("erros", [])
                 codigo_erro = None
                 mensagem_erro_completa = str(erros)
-
                 if isinstance(erros, list) and len(erros) > 0 and isinstance(erros[0], dict):
                     erro_obj = erros[0].get("erro", {}) if isinstance(erros[0], dict) else {}
                     codigo_erro = erro_obj.get("codigo_erro")
@@ -605,14 +570,12 @@ def buscar_e_gravar_produtos(conn, api_token):
                 elif isinstance(erros, str): 
                     if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
                         codigo_erro = "22"
-                
                 if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
                     match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
                     if match and match.group(1) == "22":
                         codigo_erro = "22"
                     elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower(): 
                         codigo_erro = "22"
-
                 if codigo_erro == "22":
                     print(f"API de produtos (carga completa): Nenhuma página adicional encontrada (Erro 22 na página {pagina_atual}). Todos os produtos foram listados.")
                     todos_produtos_processados_carga_completa = True
@@ -624,7 +587,6 @@ def buscar_e_gravar_produtos(conn, api_token):
                     print(f"Erro da API Tiny ao listar produtos (página {pagina_atual}): {erros}")
                     salvar_progresso_paginacao_produtos(pagina_atual) 
                     return conn, False, True 
-
             produtos_da_pagina = data.get("retorno", {}).get("produtos", [])
             if not produtos_da_pagina:
                 print(f"Fim da lista de produtos (página {pagina_atual} vazia). Todos os produtos foram listados.")
@@ -633,28 +595,33 @@ def buscar_e_gravar_produtos(conn, api_token):
                 salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
                 print("Carga completa de produtos finalizada (página vazia). Timestamp salvo.")
                 break 
-
             print(f"Encontrados {len(produtos_da_pagina)} produtos na página {pagina_atual}.")
+            commit_needed_for_page = False
             for produto_wrapper in produtos_da_pagina:
                 produto_lista = produto_wrapper.get("produto")
                 if not produto_lista or not produto_lista.get("id"):
                     print(f"AVISO: Produto da lista com dados incompletos ou sem ID ignorado: {produto_lista}")
                     continue
-                
                 conn, success_detail = buscar_e_gravar_detalhe_produto(conn, api_token, produto_lista["id"])
                 if not success_detail:
                     print(f"Falha ao processar detalhe do produto ID {produto_lista['id']} da lista. Continuando...")
                 else:
                     produtos_processados_neste_lote += 1
-            
-            conn.commit()
-            print(f"Commit realizado para produtos da página {pagina_atual}.")
-            
+                    commit_needed_for_page = True
+            if commit_needed_for_page:
+                try:
+                    conn.commit()
+                    print(f"Commit realizado para produtos da página {pagina_atual}.")
+                except psycopg2.Error as e:
+                    print(f"Erro ao commitar produtos da página {pagina_atual}: {e}. Tentando rollback...")
+                    try: conn.rollback()
+                    except psycopg2.Error as rb_err: print(f"Erro no rollback: {rb_err}")
+                    salvar_progresso_paginacao_produtos(pagina_atual) # Salva para tentar esta página de novo
+                    return conn, False, True # Indica falha e que há produtos restantes
             paginas_processadas_neste_lote += 1
             pagina_atual += 1
             salvar_progresso_paginacao_produtos(pagina_atual) 
             time.sleep(PAUSA_ENTRE_PAGINAS)
-
         except requests.exceptions.RequestException as e:
             print(f"Erro de requisição ao listar produtos (página {pagina_atual}): {e}")
             salvar_progresso_paginacao_produtos(pagina_atual)
@@ -670,7 +637,6 @@ def buscar_e_gravar_produtos(conn, api_token):
                 except psycopg2.Error as rb_error: print(f"Erro no rollback de produtos: {rb_error}")
             salvar_progresso_paginacao_produtos(pagina_atual)
             return conn, False, True
-
     if todos_produtos_processados_carga_completa:
         print("Todos os produtos da carga completa foram processados.")
         return conn, True, False 
@@ -691,12 +657,10 @@ def buscar_e_gravar_detalhe_produto(conn, api_token, id_produto_tiny):
         response = requests.post(endpoint_detalhe, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
         response.raise_for_status()
         data = response.json()
-
         if data.get("retorno", {}).get("status") == "Erro":
             erros = data.get("retorno", {}).get("erros", [])
             print(f"Erro da API Tiny ao obter detalhes do produto ID {id_produto_tiny}: {erros}")
             return conn, True 
-
         produto_detalhe = data.get("retorno", {}).get("produto")
         if not produto_detalhe:
             print(f"AVISO: Detalhes do produto ID {id_produto_tiny} não encontrados na resposta da API ou formato inesperado: {data}")
@@ -704,10 +668,11 @@ def buscar_e_gravar_detalhe_produto(conn, api_token, id_produto_tiny):
                  print("ERRO FATAL: Token da API Tiny inválido ou não informado. Verifique a configuração.")
                  return conn, False 
             return conn, True 
-
         id_prod = produto_detalhe.get("id")
         nome = produto_detalhe.get("nome")
-        sku = produto_detalhe.get("codigo") 
+        sku_api = produto_detalhe.get("codigo") 
+        # AJUSTE: Converter SKU vazio para None (NULL no DB)
+        sku_db = sku_api if sku_api != "" else None
         preco_venda = produto_detalhe.get("preco")
         unidade = produto_detalhe.get("unidade")
         situacao = produto_detalhe.get("situacao")
@@ -719,12 +684,10 @@ def buscar_e_gravar_detalhe_produto(conn, api_token, id_produto_tiny):
         if id_categoria_api:
             try: id_categoria_db = int(id_categoria_api)
             except ValueError: print(f"AVISO: id_categoria '{id_categoria_api}' do produto {id_prod} não é um inteiro válido.")
-
         if not id_prod or not nome:
             print(f"AVISO: Produto com ID ou Nome ausente nos detalhes ignorado: {produto_detalhe}")
             return conn, True
-        
-        print(f"Inserindo/Atualizando produto detalhado ID: {id_prod}, Nome: {nome[:30]}...")
+        print(f"Inserindo/Atualizando produto detalhado ID: {id_prod}, Nome: {nome[:30]}..., SKU: {sku_db}")
         cursor = None
         try:
             conn = garantir_conexao(conn)
@@ -747,16 +710,23 @@ def buscar_e_gravar_detalhe_produto(conn, api_token, id_produto_tiny):
                 id_categoria_produto_tiny = EXCLUDED.id_categoria_produto_tiny,
                 data_atualizacao = CURRENT_TIMESTAMP;
             """
-            cursor.execute(upsert_query, (id_prod, nome, sku, preco_venda, unidade, situacao, 
+            cursor.execute(upsert_query, (id_prod, nome, sku_db, preco_venda, unidade, situacao, 
                                         preco_custo, tipo_produto, estoque_atual, id_categoria_db))
+            # O commit será feito por página na função chamadora (buscar_e_gravar_produtos)
             time.sleep(PAUSA_ENTRE_CHAMADAS_DETALHE)
             return conn, True
         except (Exception, psycopg2.Error) as error:
             print(f"Erro ao inserir/atualizar produto ID {id_prod}: {error}")
-            return conn, False
+            # AJUSTE: Garantir rollback em caso de erro de DB para não abortar a transação da página inteira
+            if conn and conn.closed == 0:
+                try: 
+                    conn.rollback()
+                    print(f"Rollback realizado para o produto ID {id_prod} devido a erro.")
+                except psycopg2.Error as rb_error: 
+                    print(f"Erro no rollback para produto ID {id_prod}: {rb_error}")
+            return conn, False # Indica falha no processamento deste produto
         finally:
             if cursor: cursor.close()
-
     except requests.exceptions.HTTPError as http_err:
         print(f"Erro HTTP ao obter detalhes do produto ID {id_produto_tiny}: {http_err}")
         if response is not None and response.status_code == 404:
@@ -780,10 +750,8 @@ def buscar_e_gravar_vendedores(conn, api_token):
     print("\n--- Iniciando Sincronização de Vendedores (Contatos) ---")
     conn = garantir_conexao(conn)
     if conn is None: return conn, False
-
     pagina_atual = 1
     todos_vendedores_processados = False
-
     while not todos_vendedores_processados:
         print(f"Buscando lista de vendedores (página {pagina_atual})...")
         endpoint_vendedores = f"{TINY_API_V2_BASE_URL}/contatos.pesquisar.php" 
@@ -793,7 +761,6 @@ def buscar_e_gravar_vendedores(conn, api_token):
             response = requests.post(endpoint_vendedores, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
             response.raise_for_status()
             data = response.json()
-
             if data.get("retorno", {}).get("status") == "Erro":
                 erros = data.get("retorno", {}).get("erros", [])
                 codigo_erro = None
@@ -805,14 +772,12 @@ def buscar_e_gravar_vendedores(conn, api_token):
                 elif isinstance(erros, str):
                      if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
                         codigo_erro = "22"
-                
                 if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
                     match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
                     if match and match.group(1) == "22":
                         codigo_erro = "22"
                     elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower():
                         codigo_erro = "22"
-
                 if codigo_erro == "22":
                     print(f"API de vendedores: Nenhuma página adicional encontrada (Erro 22 na página {pagina_atual}).")
                     todos_vendedores_processados = True
@@ -820,15 +785,14 @@ def buscar_e_gravar_vendedores(conn, api_token):
                 else:
                     print(f"Erro da API Tiny ao listar vendedores (página {pagina_atual}): {erros}")
                     return conn, False 
-
             vendedores_da_pagina = data.get("retorno", {}).get("contatos", [])
             if not vendedores_da_pagina:
                 print(f"Fim da lista de vendedores (página {pagina_atual} vazia).")
                 todos_vendedores_processados = True
                 break
-
             print(f"Encontrados {len(vendedores_da_pagina)} contatos (potenciais vendedores) na página {pagina_atual}.")
             cursor = None
+            commit_needed_for_page = False
             try:
                 conn = garantir_conexao(conn)
                 if conn is None: return conn, False
@@ -837,15 +801,12 @@ def buscar_e_gravar_vendedores(conn, api_token):
                     contato = contato_wrapper.get("contato")
                     if not contato or contato.get("tipo_pessoa") != "V": 
                         continue
-
                     id_vendedor = contato.get("id")
                     nome_vendedor = contato.get("nome")
                     situacao_vendedor = contato.get("situacao_vendedor", "Ativo") 
-                    
                     if not id_vendedor or not nome_vendedor:
                         print(f"AVISO: Vendedor com ID ou Nome ausente ignorado: {contato}")
                         continue
-
                     print(f"Inserindo/Atualizando vendedor ID: {id_vendedor}, Nome: {nome_vendedor}")
                     upsert_query = """
                     INSERT INTO vendedores (id_vendedor_tiny, nome_vendedor, situacao_vendedor, data_atualizacao)
@@ -857,11 +818,11 @@ def buscar_e_gravar_vendedores(conn, api_token):
                         data_atualizacao = CURRENT_TIMESTAMP;
                     """
                     cursor.execute(upsert_query, (id_vendedor, nome_vendedor, situacao_vendedor))
+                    commit_needed_for_page = True
                     time.sleep(PAUSA_ENTRE_CHAMADAS_DETALHE) 
-                
-                conn.commit()
-                print(f"Commit realizado para vendedores da página {pagina_atual}.")
-
+                if commit_needed_for_page:
+                    conn.commit()
+                    print(f"Commit realizado para vendedores da página {pagina_atual}.")
             except (Exception, psycopg2.Error) as error:
                 print(f"Erro ao inserir/atualizar vendedores da página {pagina_atual}: {error}")
                 if conn and conn.closed == 0: 
@@ -870,10 +831,8 @@ def buscar_e_gravar_vendedores(conn, api_token):
                 return conn, False
             finally:
                 if cursor: cursor.close()
-            
             pagina_atual += 1
             time.sleep(PAUSA_ENTRE_PAGINAS)
-
         except requests.exceptions.RequestException as e:
             print(f"Erro de requisição ao listar vendedores (página {pagina_atual}): {e}")
             return conn, False
@@ -886,7 +845,6 @@ def buscar_e_gravar_vendedores(conn, api_token):
                 try: conn.rollback(); print("Rollback da transação de vendedores realizado.")
                 except psycopg2.Error as rb_error: print(f"Erro no rollback de vendedores: {rb_error}")
             return conn, False
-
     print("Sincronização de vendedores concluída.")
     return conn, True
 
@@ -894,32 +852,26 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
     print("\n--- Iniciando Sincronização de Pedidos e Itens de Pedido ---")
     conn = garantir_conexao(conn)
     if conn is None: return conn, False
-
     pagina_atual = 1
     todos_pedidos_processados = False
     pedidos_processados_total = 0
     itens_processados_total = 0
-
     ultimo_timestamp_pedidos_str = ler_timestamp_progresso(ARQUIVO_TIMESTAMP_PEDIDOS)
-
     if ultimo_timestamp_pedidos_str:
         print(f"Modo incremental para pedidos ativado. Buscando alterações desde: {ultimo_timestamp_pedidos_str}")
         endpoint_pedidos_lista = f"{TINY_API_V2_BASE_URL}/pedidos.pesquisar.php"
         payload_base = {"token": api_token, "formato": "json", "data_alteracao_inicial": ultimo_timestamp_pedidos_str}
         pagina_api_incremental = 1
-
         while True: 
             payload = payload_base.copy()
             if pagina_api_incremental > 1:
                 payload["pagina"] = pagina_api_incremental
-            
             print(f"Buscando pedidos alterados (página {pagina_api_incremental}) desde {ultimo_timestamp_pedidos_str}...")
             response = None
             try:
                 response = requests.post(endpoint_pedidos_lista, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=120) 
                 response.raise_for_status()
                 data = response.json()
-
                 if data.get("retorno", {}).get("status") == "Erro":
                     erros = data.get("retorno", {}).get("erros", [])
                     codigo_erro = None
@@ -931,21 +883,18 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                     elif isinstance(erros, str):
                         if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
                             codigo_erro = "22"
-                    
                     if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
                         match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
                         if match and match.group(1) == "22":
                             codigo_erro = "22"
                         elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower():
                              codigo_erro = "22"
-
                     if codigo_erro == "22":
                         print(f"API de pedidos alterados: Nenhuma página adicional encontrada (Erro 22 na página {pagina_api_incremental}).")
                         break 
                     else:
                         print(f"Erro da API Tiny ao listar pedidos alterados (página {pagina_api_incremental}): {erros}")
                         return conn, False 
-
                 pedidos_da_pagina = data.get("retorno", {}).get("pedidos", [])
                 if not pedidos_da_pagina and pagina_api_incremental == 1:
                     print("Nenhum pedido alterado encontrado desde o último timestamp.")
@@ -954,20 +903,24 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                 if not pedidos_da_pagina:
                     print(f"Fim da lista de pedidos alterados (página {pagina_api_incremental} vazia).")
                     break 
-
                 print(f"Encontrados {len(pedidos_da_pagina)} pedidos alterados na página {pagina_api_incremental}.")
                 conn, success_page, p_proc, i_proc = processar_pagina_de_pedidos(conn, api_token, pedidos_da_pagina, "incremental")
                 pedidos_processados_total += p_proc
                 itens_processados_total += i_proc
                 if not success_page:
                     print(f"Falha ao processar página {pagina_api_incremental} de pedidos alterados. Abortando sincronização de pedidos.")
+                    # Rollback já deve ter sido feito em processar_pagina_de_pedidos ou buscar_e_gravar_detalhe_pedido_e_itens
                     return conn, False
-                
-                conn.commit()
-                print(f"Commit realizado para pedidos alterados da página {pagina_api_incremental}.")
+                try:
+                    conn.commit()
+                    print(f"Commit realizado para pedidos alterados da página {pagina_api_incremental}.")
+                except psycopg2.Error as e:
+                    print(f"Erro ao commitar pedidos alterados da página {pagina_api_incremental}: {e}. Tentando rollback...")
+                    try: conn.rollback()
+                    except psycopg2.Error as rb_err: print(f"Erro no rollback: {rb_err}")
+                    return conn, False
                 time.sleep(PAUSA_ENTRE_PAGINAS)
                 pagina_api_incremental += 1
-
             except requests.exceptions.RequestException as e:
                 print(f"Erro de requisição ao listar pedidos alterados (página {pagina_api_incremental}): {e}")
                 return conn, False
@@ -980,14 +933,11 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                     try: conn.rollback(); print("Rollback da transação de pedidos alterados realizado.")
                     except psycopg2.Error as rb_error: print(f"Erro no rollback de pedidos alterados: {rb_error}")
                 return conn, False
-        
         salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PEDIDOS, datetime.now(timezone.utc))
         print(f"Sincronização incremental de pedidos concluída. Total de {pedidos_processados_total} pedidos e {itens_processados_total} itens processados.")
         return conn, True
-
     print(f"Modo de carga completa para pedidos ativado. Iniciando da página {pagina_atual}.")
     endpoint_pedidos_lista_completa = f"{TINY_API_V2_BASE_URL}/pedidos.pesquisar.php"
-
     while not todos_pedidos_processados:
         print(f"Buscando lista de pedidos (carga completa, página {pagina_atual})...")
         payload = {"token": api_token, "formato": "json", "pagina": pagina_atual}
@@ -996,7 +946,6 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
             response = requests.post(endpoint_pedidos_lista_completa, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=120)
             response.raise_for_status()
             data = response.json()
-
             if data.get("retorno", {}).get("status") == "Erro":
                 erros = data.get("retorno", {}).get("erros", [])
                 codigo_erro = None
@@ -1008,14 +957,12 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                 elif isinstance(erros, str):
                     if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
                         codigo_erro = "22"
-                
                 if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
                     match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
                     if match and match.group(1) == "22":
                         codigo_erro = "22"
                     elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower():
                         codigo_erro = "22"
-
                 if codigo_erro == "22":
                     print(f"API de pedidos (carga completa): Nenhuma página adicional encontrada (Erro 22 na página {pagina_atual}).")
                     todos_pedidos_processados = True
@@ -1023,13 +970,11 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                 else:
                     print(f"Erro da API Tiny ao listar pedidos (carga completa, página {pagina_atual}): {erros}")
                     return conn, False 
-
             pedidos_da_pagina = data.get("retorno", {}).get("pedidos", [])
             if not pedidos_da_pagina:
                 print(f"Fim da lista de pedidos (carga completa, página {pagina_atual} vazia).")
                 todos_pedidos_processados = True
                 break
-
             print(f"Encontrados {len(pedidos_da_pagina)} pedidos na carga completa (página {pagina_atual}).")
             conn, success_page, p_proc, i_proc = processar_pagina_de_pedidos(conn, api_token, pedidos_da_pagina, "carga completa")
             pedidos_processados_total += p_proc
@@ -1037,12 +982,16 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
             if not success_page:
                 print(f"Falha ao processar página {pagina_atual} de pedidos (carga completa). Abortando sincronização.")
                 return conn, False
-            
-            conn.commit()
-            print(f"Commit realizado para pedidos da carga completa (página {pagina_atual}).")
+            try:
+                conn.commit()
+                print(f"Commit realizado para pedidos da carga completa (página {pagina_atual}).")
+            except psycopg2.Error as e:
+                print(f"Erro ao commitar pedidos da carga completa (página {pagina_atual}): {e}. Tentando rollback...")
+                try: conn.rollback()
+                except psycopg2.Error as rb_err: print(f"Erro no rollback: {rb_err}")
+                return conn, False # Falha no commit da página, aborta
             pagina_atual += 1
             time.sleep(PAUSA_ENTRE_PAGINAS)
-
         except requests.exceptions.RequestException as e:
             print(f"Erro de requisição ao listar pedidos (carga completa, página {pagina_atual}): {e}")
             return conn, False
@@ -1055,32 +1004,34 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                 try: conn.rollback(); print("Rollback da transação de pedidos (carga completa) realizado.")
                 except psycopg2.Error as rb_error: print(f"Erro no rollback de pedidos (carga completa): {rb_error}")
             return conn, False
-
     if todos_pedidos_processados:
         salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PEDIDOS, datetime.now(timezone.utc))
         print(f"Carga completa de pedidos finalizada. Timestamp salvo. Total de {pedidos_processados_total} pedidos e {itens_processados_total} itens processados.")
     else:
         print(f"Sincronização de pedidos (carga completa) interrompida. Total de {pedidos_processados_total} pedidos e {itens_processados_total} itens processados até o momento.")
-    
     return conn, True
 
 def processar_pagina_de_pedidos(conn, api_token, pedidos_da_pagina, tipo_carga="desconhecido"):
     pedidos_processados_na_pagina = 0
     itens_processados_na_pagina = 0
+    pagina_com_falha_em_item = False
     for pedido_wrapper in pedidos_da_pagina:
         pedido_lista = pedido_wrapper.get("pedido")
         if not pedido_lista or not pedido_lista.get("id"):
             print(f"AVISO (Pedidos - {tipo_carga}): Pedido da lista com dados incompletos ou sem ID ignorado: {pedido_lista}")
             continue
-        
         id_pedido_tiny = pedido_lista.get("id")
         conn, success_det, itens_proc_det = buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo_carga)
         if not success_det:
             print(f"Falha ao processar detalhes do pedido ID {id_pedido_tiny} ({tipo_carga}). Continuando com os próximos, mas a página será marcada como falha parcial.")
-            return conn, False, pedidos_processados_na_pagina, itens_processados_na_pagina
+            pagina_com_falha_em_item = True 
+            # Não retorna imediatamente, tenta processar outros pedidos da página, mas a página inteira não será commitada se houver falha.
         else:
             pedidos_processados_na_pagina += 1
             itens_processados_na_pagina += itens_proc_det
+    if pagina_com_falha_em_item:
+        print(f"Falha no processamento de um ou mais itens/pedidos na página ({tipo_carga}). Rollback da página será feito pela função chamadora.")
+        return conn, False, pedidos_processados_na_pagina, itens_processados_na_pagina
     return conn, True, pedidos_processados_na_pagina, itens_processados_na_pagina
 
 def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo_carga="desconhecido"):
@@ -1093,36 +1044,30 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
         response = requests.post(endpoint_detalhe, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
         response.raise_for_status()
         data = response.json()
-
         if data.get("retorno", {}).get("status") == "Erro":
             erros = data.get("retorno", {}).get("erros", [])
             print(f"Erro da API Tiny ao obter detalhes do pedido ID {id_pedido_tiny} ({tipo_carga}): {erros}")
             return conn, True, 0 
-
         pedido_detalhe = data.get("retorno", {}).get("pedido")
         if not pedido_detalhe:
             print(f"AVISO: Detalhes do pedido ID {id_pedido_tiny} ({tipo_carga}) não encontrados na resposta da API: {data}")
             return conn, True, 0
-
         id_pedido = pedido_detalhe.get("id")
         numero_pedido = pedido_detalhe.get("numero")
         data_pedido_str = pedido_detalhe.get("data_pedido")
         data_pedido_db = format_date_to_db(data_pedido_str)
-        
         id_lista_preco = pedido_detalhe.get("id_lista_preco")
         desc_lista_preco = pedido_detalhe.get("descricao_lista_preco")
         nome_cliente = pedido_detalhe.get("cliente", {}).get("nome")
         cpf_cnpj_cliente = pedido_detalhe.get("cliente", {}).get("cpf_cnpj")
         email_cliente = pedido_detalhe.get("cliente", {}).get("email")
         fone_cliente = pedido_detalhe.get("cliente", {}).get("fone")
-        
         id_vendedor_api = pedido_detalhe.get("id_vendedor")
         id_vendedor_db = None
         if id_vendedor_api:
             try: id_vendedor_db = int(id_vendedor_api)
             except ValueError: print(f"AVISO (Pedido {id_pedido}): id_vendedor '{id_vendedor_api}' não é um inteiro válido.")
         nome_vendedor_pedido = pedido_detalhe.get("nome_vendedor") 
-
         situacao_pedido = pedido_detalhe.get("situacao")
         valor_total_pedido = pedido_detalhe.get("total_pedido")
         valor_desconto_pedido = pedido_detalhe.get("valor_desconto")
@@ -1131,11 +1076,9 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
         forma_pagamento_db = forma_pagamento_api
         if isinstance(forma_pagamento_api, dict):
             forma_pagamento_db = forma_pagamento_api.get("descricao_forma_pagamento", str(forma_pagamento_api))
-
         if not id_pedido:
             print(f"AVISO (Pedido - {tipo_carga}): Pedido com ID ausente nos detalhes ignorado: {pedido_detalhe}")
             return conn, True, 0
-
         print(f"Inserindo/Atualizando pedido detalhado ID: {id_pedido}, Numero: {numero_pedido} ({tipo_carga})")
         cursor = None
         try:
@@ -1164,26 +1107,23 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
                 cpf_cnpj_cliente, email_cliente, fone_cliente, id_vendedor_db, nome_vendedor_pedido, situacao_pedido,
                 valor_total_pedido, valor_desconto_pedido, condicao_pagamento, forma_pagamento_db
             ))
-
             itens_do_pedido = pedido_detalhe.get("itens", [])
             if itens_do_pedido:
                 delete_itens_query = "DELETE FROM itens_pedido WHERE id_pedido_tiny = %s;"
                 cursor.execute(delete_itens_query, (id_pedido,))
                 print(f"Itens antigos do pedido ID {id_pedido} removidos antes de inserir os novos.")
-
                 for item_wrapper in itens_do_pedido:
                     item = item_wrapper.get("item")
                     if not item:
                         print(f"AVISO (Pedido {id_pedido} - {tipo_carga}): Item de pedido em formato inválido ignorado: {item_wrapper}")
                         continue
-                    
                     id_produto_item_api = item.get("id_produto")
                     id_produto_item_db = None
                     if id_produto_item_api:
                         try: id_produto_item_db = int(id_produto_item_api)
                         except ValueError: print(f"AVISO (Pedido {id_pedido}, Item SKU {item.get('codigo')}): id_produto '{id_produto_item_api}' não é um inteiro válido.")
-
-                    sku_produto_item = item.get("codigo") 
+                    sku_produto_item_api = item.get("codigo") 
+                    sku_produto_item_db = sku_produto_item_api if sku_produto_item_api != "" else None
                     descricao_item = item.get("descricao")
                     unidade_item = item.get("unidade")
                     quantidade_item = item.get("quantidade")
@@ -1192,11 +1132,9 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
                     if quantidade_item is not None and valor_unitario_item is not None:
                         try: valor_total_calculado = float(quantidade_item) * float(valor_unitario_item)
                         except ValueError: print(f"AVISO (Pedido {id_pedido}, Item {descricao_item}): Não foi possível calcular valor total do item.")
-                    
                     if not descricao_item: 
                         print(f"AVISO (Pedido {id_pedido} - {tipo_carga}): Item de pedido sem descrição ignorado: {item}")
                         continue
-
                     insert_item_query = """
                     INSERT INTO itens_pedido (id_pedido_tiny, id_produto_tiny, sku_produto, descricao_item, 
                                             unidade_item, quantidade_item, valor_unitario_item, valor_total_item, 
@@ -1204,21 +1142,24 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP);
                     """
                     cursor.execute(insert_item_query, (
-                        id_pedido, id_produto_item_db, sku_produto_item, descricao_item, unidade_item,
+                        id_pedido, id_produto_item_db, sku_produto_item_db, descricao_item, unidade_item,
                         quantidade_item, valor_unitario_item, valor_total_calculado
                     ))
                     itens_processados_neste_pedido += 1
                 print(f"{itens_processados_neste_pedido} itens processados para o pedido ID {id_pedido} ({tipo_carga}).")
-            
             time.sleep(PAUSA_ENTRE_CHAMADAS_DETALHE)
             return conn, True, itens_processados_neste_pedido
-
         except (Exception, psycopg2.Error) as error:
             print(f"Erro ao inserir/atualizar pedido ID {id_pedido} ou seus itens ({tipo_carga}): {error}")
+            if conn and conn.closed == 0:
+                try: 
+                    conn.rollback()
+                    print(f"Rollback realizado para o pedido ID {id_pedido} devido a erro.")
+                except psycopg2.Error as rb_error: 
+                    print(f"Erro no rollback para pedido ID {id_pedido}: {rb_error}")
             return conn, False, itens_processados_neste_pedido 
         finally:
             if cursor: cursor.close()
-
     except requests.exceptions.HTTPError as http_err:
         print(f"Erro HTTP ao obter detalhes do pedido ID {id_pedido_tiny} ({tipo_carga}): {http_err}")
         if response is not None and response.status_code == 404:
@@ -1241,51 +1182,57 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
 def main():
     print("Iniciando script de integração Tiny ERP -> PostgreSQL...")
     start_time = time.time()
-
     conn = conectar_db()
     if conn is None:
         print("Falha ao conectar ao banco de dados. Abortando script.")
         return
-
     conn, success_cat_tbl = criar_tabela_categorias(conn)
     conn, success_prod_tbl = criar_tabela_produtos(conn)
     conn, success_vend_tbl = criar_tabela_vendedores(conn)
     conn, success_ped_tbl = criar_tabela_pedidos(conn)
     conn, success_item_ped_tbl = criar_tabela_itens_pedido(conn)
-
     if not (success_cat_tbl and success_prod_tbl and success_vend_tbl and success_ped_tbl and success_item_ped_tbl):
         print("Falha ao criar uma ou mais tabelas. Verifique os logs. Abortando script.")
         if conn and conn.closed == 0: conn.close()
         return
-    
     conn, success_sync_cat = buscar_e_gravar_categorias(conn, TINY_API_V2_TOKEN)
     if not success_sync_cat:
         print("Sincronização de categorias falhou. Verifique os logs.")
+    # Loop para processar produtos em lotes até que todos sejam concluídos ou ocorra um erro não recuperável
+    while True:
+        conn, success_sync_prod, produtos_ainda_restantes = buscar_e_gravar_produtos(conn, TINY_API_V2_TOKEN)
+        if not success_sync_prod:
+            print("Sincronização de produtos falhou ou foi parcial neste lote. Verifique os logs.")
+            # Se a sincronização de produtos falhar, não adianta continuar com o restante no mesmo ciclo
+            break 
+        if not produtos_ainda_restantes:
+            print("Todos os produtos foram processados.")
+            break # Sai do loop de produtos
+        print("Ainda existem produtos a serem processados na carga completa. Continuando para o próximo lote...")
+        # Uma pequena pausa antes de tentar o próximo lote de produtos pode ser útil
+        time.sleep(PAUSA_ENTRE_PAGINAS * 2) 
 
-    conn, success_sync_prod, produtos_ainda_restantes = buscar_e_gravar_produtos(conn, TINY_API_V2_TOKEN)
-    if not success_sync_prod:
-        print("Sincronização de produtos falhou ou foi parcial neste lote. Verifique os logs.")
-    if produtos_ainda_restantes:
-        print("Ainda existem produtos a serem processados na carga completa. Execute o script novamente para continuar.")
-        if conn and conn.closed == 0: conn.close()
-        end_time = time.time()
-        print(f"Script concluído (parcialmente devido a produtos restantes). Tempo total: {end_time - start_time:.2f} segundos.")
-        return 
-
-    conn, success_sync_vend = buscar_e_gravar_vendedores(conn, TINY_API_V2_TOKEN)
-    if not success_sync_vend:
-        print("Sincronização de vendedores falhou. Verifique os logs.")
-
-    conn, success_sync_ped = buscar_e_gravar_pedidos_e_itens(conn, TINY_API_V2_TOKEN)
-    if not success_sync_ped:
-        print("Sincronização de pedidos e itens falhou. Verifique os logs.")
+    # Só continua para vendedores e pedidos se produtos foram processados com sucesso (ou não havia mais)
+    if success_sync_prod and not produtos_ainda_restantes:
+        conn, success_sync_vend = buscar_e_gravar_vendedores(conn, TINY_API_V2_TOKEN)
+        if not success_sync_vend:
+            print("Sincronização de vendedores falhou. Verifique os logs.")
+        conn, success_sync_ped = buscar_e_gravar_pedidos_e_itens(conn, TINY_API_V2_TOKEN)
+        if not success_sync_ped:
+            print("Sincronização de pedidos e itens falhou. Verifique os logs.")
+    elif produtos_ainda_restantes:
+        print("Script encerrando pois ainda há produtos restantes da carga completa para processar em uma próxima execução.")
+    else: # Falha na sincronização de produtos
+        print("Script encerrando devido à falha na sincronização de produtos.")
 
     if conn and conn.closed == 0:
         conn.close()
         print("Conexão com o PostgreSQL fechada.")
-
     end_time = time.time()
-    print(f"Script de integração concluído. Tempo total: {end_time - start_time:.2f} segundos.")
+    if produtos_ainda_restantes:
+        print(f"Script concluído (parcialmente devido a produtos restantes). Tempo total: {end_time - start_time:.2f} segundos.")
+    else:
+        print(f"Script de integração concluído. Tempo total: {end_time - start_time:.2f} segundos.")
 
 if __name__ == "__main__":
     main()
