@@ -470,7 +470,7 @@ def extrair_codigo_erro_api(erros_api):
         elif "Codigo: 23" in erros_api: # Adicionado para tratar erro 23 explicitamente
              codigo_erro = "23"
     if not codigo_erro:
-        match_codigo = re.search(r"(?:Codigo:\s*|codigo_erro['"]?:\s*['"]?)(\d+)", mensagem_erro_completa, re.IGNORECASE)
+        match_codigo = re.search(r"(?:Codigo:\s*|codigo_erro[""]?:\s*[""]?)(\d+)", mensagem_erro_completa, re.IGNORECASE)
         if match_codigo:
             codigo_erro = match_codigo.group(1)
     if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
