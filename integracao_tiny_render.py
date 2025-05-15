@@ -455,6 +455,28 @@ def resetar_progresso_paginacao_produtos():
     else:
         print(f"Arquivo de progresso de paginação de produtos ({ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}) não encontrado para remoção.")
 
+def extrair_codigo_erro_api(erros_api):
+    """Tenta extrair o código de erro da resposta da API Tiny."""
+    codigo_erro = None
+    mensagem_erro_completa = str(erros_api)
+    if isinstance(erros_api, list) and len(erros_api) > 0 and isinstance(erros_api[0], dict):
+        erro_obj = erros_api[0].get("erro", {}) if isinstance(erros_api[0], dict) else {}
+        codigo_erro = erro_obj.get("codigo_erro")
+    elif isinstance(erros_api, dict):
+        codigo_erro = erros_api.get("erro", {}).get("codigo_erro")
+    elif isinstance(erros_api, str):
+        if "Codigo: 22" in erros_api or "pagina nao encontrada" in erros_api.lower() or "página não encontrada" in erros_api.lower():
+            codigo_erro = "22"
+        elif "Codigo: 23" in erros_api: # Adicionado para tratar erro 23 explicitamente
+             codigo_erro = "23"
+    if not codigo_erro:
+        match_codigo = re.search(r"(?:Codigo:\s*|codigo_erro["']?:\s*["']?)(\d+)", mensagem_erro_completa, re.IGNORECASE)
+        if match_codigo:
+            codigo_erro = match_codigo.group(1)
+    if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
+        codigo_erro = "22" # Assume 22 se a mensagem textual indicar fim de página
+    return codigo_erro
+
 def buscar_e_gravar_produtos(conn, api_token):
     print("\n--- Iniciando Sincronização de Produtos ---")
     conn = garantir_conexao(conn)
@@ -475,27 +497,22 @@ def buscar_e_gravar_produtos(conn, api_token):
                  payload["pagina"] = pagina_api_incremental
             print(f"Buscando produtos alterados (página {pagina_api_incremental}) desde {ultimo_timestamp_produtos_str}...")
             response = None
+            data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
             try:
                 response = requests.post(endpoint_produtos_alteracoes, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
                 response.raise_for_status()
                 data = response.json()
-                if data.get("retorno", {}).get("status") == "Erro":
-                    erros = data.get("retorno", {}).get("erros", [])
-                    codigo_erro = None
-                    if isinstance(erros, list) and len(erros) > 0 and isinstance(erros[0], dict):
-                        codigo_erro = erros[0].get("erro", {}).get("codigo_erro")
-                    elif isinstance(erros, dict): 
-                        codigo_erro = erros.get("erro", {}).get("codigo_erro")
-                    elif isinstance(erros, str): 
-                        if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower():
-                            codigo_erro = "22"
-                    if codigo_erro == "22": 
-                        print("API de alterações de produtos: Nenhuma página adicional encontrada (Erro 22).")
+                retorno_api = data.get("retorno", {})
+                if retorno_api.get("status") == "Erro":
+                    erros = retorno_api.get("erros", [])
+                    codigo_erro = extrair_codigo_erro_api(erros)
+                    if codigo_erro in ["22", "23"]:
+                        print(f"API de alterações de produtos: Nenhuma página adicional encontrada (Erro {codigo_erro}).")
                         break 
                     else:
                         print(f"Erro da API Tiny ao buscar produtos alterados: {erros}")
                         return conn, False, True 
-                produtos_alterados = data.get("retorno", {}).get("produtos", [])
+                produtos_alterados = retorno_api.get("produtos", [])
                 if not produtos_alterados and pagina_api_incremental == 1:
                     print("Nenhum produto alterado encontrado desde o último timestamp.")
                     salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
@@ -506,7 +523,6 @@ def buscar_e_gravar_produtos(conn, api_token):
                 print(f"Encontrados {len(produtos_alterados)} produtos alterados na página {pagina_api_incremental}.")
                 commit_needed_for_page = False
                 for produto_wrapper in produtos_alterados:
-                    # AJUSTE: Verificar se produto_wrapper é um dicionário
                     if not isinstance(produto_wrapper, dict):
                         print(f"AVISO: Item de produto alterado em formato inesperado (não é dicionário) ignorado: {produto_wrapper}")
                         continue
@@ -537,10 +553,9 @@ def buscar_e_gravar_produtos(conn, api_token):
             except requests.exceptions.JSONDecodeError as e:
                 print(f"Erro ao decodificar JSON de produtos alterados: {e}. Conteúdo: {response.text if response else 'Sem resposta'}")
                 return conn, False, True
-            except AttributeError as ae: # Captura o erro 'str' object has no attribute 'get'
+            except AttributeError as ae: 
                 print(f"Erro de atributo ao processar resposta de produtos alterados (página {pagina_api_incremental}): {ae}. Resposta: {data}")
-                # Não faz rollback aqui, pois o erro é antes da interação com DB para esta página
-                return conn, False, True # Indica falha e que há produtos restantes (para tentar de novo)
+                return conn, False, True 
             except Exception as e:
                 print(f"Erro inesperado ao buscar/gravar produtos alterados (página {pagina_api_incremental}): {e}")
                 if conn and conn.closed == 0: 
@@ -557,40 +572,27 @@ def buscar_e_gravar_produtos(conn, api_token):
         print(f"Buscando lista de produtos (página {pagina_atual})...")
         payload = {"token": api_token, "formato": "json", "pesquisa": TERMO_PESQUISA_PRODUTOS_CARGA_COMPLETA, "pagina": pagina_atual}
         response = None
+        data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
         try:
             response = requests.post(endpoint_produtos_lista_completa, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
             response.raise_for_status()
             data = response.json()
-            if data.get("retorno", {}).get("status") == "Erro":
-                erros = data.get("retorno", {}).get("erros", [])
-                codigo_erro = None
-                mensagem_erro_completa = str(erros)
-                if isinstance(erros, list) and len(erros) > 0 and isinstance(erros[0], dict):
-                    erro_obj = erros[0].get("erro", {}) if isinstance(erros[0], dict) else {}
-                    codigo_erro = erro_obj.get("codigo_erro")
-                elif isinstance(erros, dict): 
-                    codigo_erro = erros.get("erro", {}).get("codigo_erro")
-                elif isinstance(erros, str): 
-                    if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
-                        codigo_erro = "22"
-                if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
-                    match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
-                    if match and match.group(1) == "22":
-                        codigo_erro = "22"
-                    elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower(): 
-                        codigo_erro = "22"
-                if codigo_erro == "22":
-                    print(f"API de produtos (carga completa): Nenhuma página adicional encontrada (Erro 22 na página {pagina_atual}). Todos os produtos foram listados.")
+            retorno_api = data.get("retorno", {})
+            if retorno_api.get("status") == "Erro":
+                erros = retorno_api.get("erros", [])
+                codigo_erro = extrair_codigo_erro_api(erros)
+                if codigo_erro in ["22", "23"]:
+                    print(f"API de produtos (carga completa): Nenhuma página adicional encontrada (Erro {codigo_erro} na página {pagina_atual}). Todos os produtos foram listados.")
                     todos_produtos_processados_carga_completa = True
                     resetar_progresso_paginacao_produtos()
                     salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
                     print("Carga completa de produtos finalizada. Timestamp salvo.")
                     break 
                 else:
-                    print(f"Erro da API Tiny ao listar produtos (página {pagina_atual}): {erros}")
+                    print(f"Erro da API Tiny ao listar produtos (página {pagina_atual}): {erros}. Código extraído: {codigo_erro}. Resposta completa: {data}")
                     salvar_progresso_paginacao_produtos(pagina_atual) 
                     return conn, False, True 
-            produtos_da_pagina = data.get("retorno", {}).get("produtos", [])
+            produtos_da_pagina = retorno_api.get("produtos", [])
             if not produtos_da_pagina:
                 print(f"Fim da lista de produtos (página {pagina_atual} vazia). Todos os produtos foram listados.")
                 todos_produtos_processados_carga_completa = True
@@ -601,7 +603,6 @@ def buscar_e_gravar_produtos(conn, api_token):
             print(f"Encontrados {len(produtos_da_pagina)} produtos na página {pagina_atual}.")
             commit_needed_for_page = False
             for produto_wrapper in produtos_da_pagina:
-                # AJUSTE: Verificar se produto_wrapper é um dicionário
                 if not isinstance(produto_wrapper, dict):
                     print(f"AVISO: Item de produto da lista em formato inesperado (não é dicionário) ignorado: {produto_wrapper}")
                     continue
@@ -637,10 +638,10 @@ def buscar_e_gravar_produtos(conn, api_token):
             print(f"Erro ao decodificar JSON de produtos (página {pagina_atual}): {e}. Conteúdo: {response.text if response else 'Sem resposta'}")
             salvar_progresso_paginacao_produtos(pagina_atual)
             return conn, False, True
-        except AttributeError as ae: # Captura o erro 'str' object has no attribute 'get'
+        except AttributeError as ae: 
             print(f"Erro de atributo ao processar resposta de produtos (página {pagina_atual}): {ae}. Resposta: {data}")
-            salvar_progresso_paginacao_produtos(pagina_atual) # Salva para tentar esta página de novo
-            return conn, False, True # Indica falha e que há produtos restantes
+            salvar_progresso_paginacao_produtos(pagina_atual) 
+            return conn, False, True 
         except Exception as e:
             print(f"Erro inesperado ao buscar/gravar produtos (página {pagina_atual}): {e}")
             if conn and conn.closed == 0: 
@@ -663,15 +664,17 @@ def buscar_e_gravar_detalhe_produto(conn, api_token, id_produto_tiny):
     endpoint_detalhe = f"{TINY_API_V2_BASE_URL}/produto.obter.php"
     payload = {"token": api_token, "formato": "json", "id": id_produto_tiny}
     response = None
+    data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
     try:
         response = requests.post(endpoint_detalhe, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=30)
         response.raise_for_status()
         data = response.json()
-        if data.get("retorno", {}).get("status") == "Erro":
-            erros = data.get("retorno", {}).get("erros", [])
+        retorno_api = data.get("retorno", {})
+        if retorno_api.get("status") == "Erro":
+            erros = retorno_api.get("erros", [])
             print(f"Erro da API Tiny ao obter detalhes do produto ID {id_produto_tiny}: {erros}")
             return conn, True 
-        produto_detalhe = data.get("retorno", {}).get("produto")
+        produto_detalhe = retorno_api.get("produto")
         if not produto_detalhe:
             print(f"AVISO: Detalhes do produto ID {id_produto_tiny} não encontrados na resposta da API ou formato inesperado: {data}")
             if response and response.text and "token invalido" in response.text.lower():
@@ -749,9 +752,9 @@ def buscar_e_gravar_detalhe_produto(conn, api_token, id_produto_tiny):
             print(f"Produto ID {id_produto_tiny} não encontrado (texto na resposta). Pode ter sido excluído.")
             return conn, True 
         return conn, False
-    except AttributeError as ae: # Captura o erro 'str' object has no attribute 'get'
+    except AttributeError as ae: 
         print(f"Erro de atributo ao processar resposta de detalhe do produto ID {id_produto_tiny}: {ae}. Resposta: {data}")
-        return conn, True # Considera como sucesso para não parar, mas loga o erro
+        return conn, True 
     except Exception as e:
         print(f"Erro inesperado ao obter detalhes do produto ID {id_produto_tiny}: {e}")
         return conn, False
@@ -767,35 +770,23 @@ def buscar_e_gravar_vendedores(conn, api_token):
         endpoint_vendedores = f"{TINY_API_V2_BASE_URL}/contatos.pesquisar.php" 
         payload = {"token": api_token, "formato": "json", "pagina": pagina_atual, "tipoPessoa": "V"} 
         response = None
+        data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
         try:
             response = requests.post(endpoint_vendedores, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
             response.raise_for_status()
             data = response.json()
-            if data.get("retorno", {}).get("status") == "Erro":
-                erros = data.get("retorno", {}).get("erros", [])
-                codigo_erro = None
-                mensagem_erro_completa = str(erros)
-                if isinstance(erros, list) and len(erros) > 0 and isinstance(erros[0], dict):
-                    codigo_erro = erros[0].get("erro", {}).get("codigo_erro")
-                elif isinstance(erros, dict):
-                    codigo_erro = erros.get("erro", {}).get("codigo_erro")
-                elif isinstance(erros, str):
-                     if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
-                        codigo_erro = "22"
-                if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
-                    match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
-                    if match and match.group(1) == "22":
-                        codigo_erro = "22"
-                    elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower():
-                        codigo_erro = "22"
-                if codigo_erro == "22":
-                    print(f"API de vendedores: Nenhuma página adicional encontrada (Erro 22 na página {pagina_atual}).")
+            retorno_api = data.get("retorno", {})
+            if retorno_api.get("status") == "Erro":
+                erros = retorno_api.get("erros", [])
+                codigo_erro = extrair_codigo_erro_api(erros)
+                if codigo_erro in ["22", "23"]:
+                    print(f"API de vendedores: Nenhuma página adicional encontrada (Erro {codigo_erro} na página {pagina_atual}).")
                     todos_vendedores_processados = True
                     break
                 else:
-                    print(f"Erro da API Tiny ao listar vendedores (página {pagina_atual}): {erros}")
+                    print(f"Erro da API Tiny ao listar vendedores (página {pagina_atual}): {erros}. Código extraído: {codigo_erro}. Resposta completa: {data}")
                     return conn, False 
-            vendedores_da_pagina = data.get("retorno", {}).get("contatos", [])
+            vendedores_da_pagina = retorno_api.get("contatos", [])
             if not vendedores_da_pagina:
                 print(f"Fim da lista de vendedores (página {pagina_atual} vazia).")
                 todos_vendedores_processados = True
@@ -884,34 +875,22 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
                 payload["pagina"] = pagina_api_incremental
             print(f"Buscando pedidos alterados (página {pagina_api_incremental}) desde {ultimo_timestamp_pedidos_str}...")
             response = None
+            data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
             try:
                 response = requests.post(endpoint_pedidos_lista, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=120) 
                 response.raise_for_status()
                 data = response.json()
-                if data.get("retorno", {}).get("status") == "Erro":
-                    erros = data.get("retorno", {}).get("erros", [])
-                    codigo_erro = None
-                    mensagem_erro_completa = str(erros)
-                    if isinstance(erros, list) and len(erros) > 0 and isinstance(erros[0], dict):
-                        codigo_erro = erros[0].get("erro", {}).get("codigo_erro")
-                    elif isinstance(erros, dict):
-                        codigo_erro = erros.get("erro", {}).get("codigo_erro")
-                    elif isinstance(erros, str):
-                        if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
-                            codigo_erro = "22"
-                    if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
-                        match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
-                        if match and match.group(1) == "22":
-                            codigo_erro = "22"
-                        elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower():
-                             codigo_erro = "22"
-                    if codigo_erro == "22":
-                        print(f"API de pedidos alterados: Nenhuma página adicional encontrada (Erro 22 na página {pagina_api_incremental}).")
+                retorno_api = data.get("retorno", {})
+                if retorno_api.get("status") == "Erro":
+                    erros = retorno_api.get("erros", [])
+                    codigo_erro = extrair_codigo_erro_api(erros)
+                    if codigo_erro in ["22", "23"]:
+                        print(f"API de pedidos alterados: Nenhuma página adicional encontrada (Erro {codigo_erro} na página {pagina_api_incremental}).")
                         break 
                     else:
-                        print(f"Erro da API Tiny ao listar pedidos alterados (página {pagina_api_incremental}): {erros}")
+                        print(f"Erro da API Tiny ao listar pedidos alterados (página {pagina_api_incremental}): {erros}. Código extraído: {codigo_erro}. Resposta completa: {data}")
                         return conn, False 
-                pedidos_da_pagina = data.get("retorno", {}).get("pedidos", [])
+                pedidos_da_pagina = retorno_api.get("pedidos", [])
                 if not pedidos_da_pagina and pagina_api_incremental == 1:
                     print("Nenhum pedido alterado encontrado desde o último timestamp.")
                     salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PEDIDOS, datetime.now(timezone.utc))
@@ -960,35 +939,23 @@ def buscar_e_gravar_pedidos_e_itens(conn, api_token):
         print(f"Buscando lista de pedidos (carga completa, página {pagina_atual})...")
         payload = {"token": api_token, "formato": "json", "pagina": pagina_atual}
         response = None
+        data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
         try:
             response = requests.post(endpoint_pedidos_lista_completa, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=120)
             response.raise_for_status()
             data = response.json()
-            if data.get("retorno", {}).get("status") == "Erro":
-                erros = data.get("retorno", {}).get("erros", [])
-                codigo_erro = None
-                mensagem_erro_completa = str(erros)
-                if isinstance(erros, list) and len(erros) > 0 and isinstance(erros[0], dict):
-                    codigo_erro = erros[0].get("erro", {}).get("codigo_erro")
-                elif isinstance(erros, dict):
-                    codigo_erro = erros.get("erro", {}).get("codigo_erro")
-                elif isinstance(erros, str):
-                    if "Codigo: 22" in erros or "pagina nao encontrada" in erros.lower() or "página não encontrada" in erros.lower():
-                        codigo_erro = "22"
-                if not codigo_erro and ("pagina nao encontrada" in mensagem_erro_completa.lower() or "página não encontrada" in mensagem_erro_completa.lower()):
-                    match = re.search(r"Codigo:\s*(\d+)", mensagem_erro_completa)
-                    if match and match.group(1) == "22":
-                        codigo_erro = "22"
-                    elif "página não encontrada" in mensagem_erro_completa.lower() or "pagina nao encontrada" in mensagem_erro_completa.lower():
-                        codigo_erro = "22"
-                if codigo_erro == "22":
-                    print(f"API de pedidos (carga completa): Nenhuma página adicional encontrada (Erro 22 na página {pagina_atual}).")
+            retorno_api = data.get("retorno", {})
+            if retorno_api.get("status") == "Erro":
+                erros = retorno_api.get("erros", [])
+                codigo_erro = extrair_codigo_erro_api(erros)
+                if codigo_erro in ["22", "23"]:
+                    print(f"API de pedidos (carga completa): Nenhuma página adicional encontrada (Erro {codigo_erro} na página {pagina_atual}).")
                     todos_pedidos_processados = True
                     break
                 else:
-                    print(f"Erro da API Tiny ao listar pedidos (carga completa, página {pagina_atual}): {erros}")
+                    print(f"Erro da API Tiny ao listar pedidos (carga completa, página {pagina_atual}): {erros}. Código extraído: {codigo_erro}. Resposta completa: {data}")
                     return conn, False 
-            pedidos_da_pagina = data.get("retorno", {}).get("pedidos", [])
+            pedidos_da_pagina = retorno_api.get("pedidos", [])
             if not pedidos_da_pagina:
                 print(f"Fim da lista de pedidos (carga completa, página {pagina_atual} vazia).")
                 todos_pedidos_processados = True
@@ -1062,16 +1029,18 @@ def buscar_e_gravar_detalhe_pedido_e_itens(conn, api_token, id_pedido_tiny, tipo
     endpoint_detalhe = f"{TINY_API_V2_BASE_URL}/pedido.obter.php"
     payload = {"token": api_token, "formato": "json", "id": id_pedido_tiny}
     response = None
+    data = None # Inicializa data para evitar UnboundLocalError no except AttributeError
     itens_processados_neste_pedido = 0
     try:
         response = requests.post(endpoint_detalhe, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=60)
         response.raise_for_status()
         data = response.json()
-        if data.get("retorno", {}).get("status") == "Erro":
-            erros = data.get("retorno", {}).get("erros", [])
+        retorno_api = data.get("retorno", {})
+        if retorno_api.get("status") == "Erro":
+            erros = retorno_api.get("erros", [])
             print(f"Erro da API Tiny ao obter detalhes do pedido ID {id_pedido_tiny} ({tipo_carga}): {erros}")
             return conn, True, 0 
-        pedido_detalhe = data.get("retorno", {}).get("pedido")
+        pedido_detalhe = retorno_api.get("pedido")
         if not pedido_detalhe:
             print(f"AVISO: Detalhes do pedido ID {id_pedido_tiny} ({tipo_carga}) não encontrados na resposta da API: {data}")
             return conn, True, 0
@@ -1227,24 +1196,31 @@ def main():
     conn, success_sync_cat = buscar_e_gravar_categorias(conn, TINY_API_V2_TOKEN)
     if not success_sync_cat:
         print("Sincronização de categorias falhou. Verifique os logs.")
-    while True:
-        conn, success_sync_prod, produtos_ainda_restantes = buscar_e_gravar_produtos(conn, TINY_API_V2_TOKEN)
-        if not success_sync_prod:
+    # Loop para produtos com controle de lote
+    produtos_ainda_restantes_geral = True
+    while produtos_ainda_restantes_geral:
+        conn, success_sync_prod_lote, produtos_ainda_restantes_lote = buscar_e_gravar_produtos(conn, TINY_API_V2_TOKEN)
+        if not success_sync_prod_lote:
             print("Sincronização de produtos falhou ou foi parcial neste lote. Verifique os logs.")
+            # Decide se quer parar tudo ou tentar o próximo lote. Por ora, paramos.
+            produtos_ainda_restantes_geral = False # Para o loop principal de produtos
             break 
-        if not produtos_ainda_restantes:
+        if not produtos_ainda_restantes_lote:
             print("Todos os produtos foram processados.")
+            produtos_ainda_restantes_geral = False # Para o loop principal de produtos
             break 
-        print("Ainda existem produtos a serem processados na carga completa. Continuando para o próximo lote...")
-        time.sleep(PAUSA_ENTRE_PAGINAS * 2) 
-    if success_sync_prod and not produtos_ainda_restantes:
+        print("Ainda existem produtos a serem processados na carga completa. O script foi projetado para processar em lotes.")
+        print("Execute o script novamente para continuar o processamento dos produtos restantes.")
+        produtos_ainda_restantes_geral = True # Garante que o log final reflita isso
+        break # Sai do while para permitir que o script termine e seja reexecutado para o próximo lote
+    if not produtos_ainda_restantes_geral: # Só executa o restante se todos os produtos foram processados
         conn, success_sync_vend = buscar_e_gravar_vendedores(conn, TINY_API_V2_TOKEN)
         if not success_sync_vend:
             print("Sincronização de vendedores falhou. Verifique os logs.")
         conn, success_sync_ped = buscar_e_gravar_pedidos_e_itens(conn, TINY_API_V2_TOKEN)
         if not success_sync_ped:
             print("Sincronização de pedidos e itens falhou. Verifique os logs.")
-    elif produtos_ainda_restantes:
+    elif produtos_ainda_restantes_geral:
         print("Script encerrando pois ainda há produtos restantes da carga completa para processar em uma próxima execução.")
     else: 
         print("Script encerrando devido à falha na sincronização de produtos.")
@@ -1252,7 +1228,7 @@ def main():
         conn.close()
         print("Conexão com o PostgreSQL fechada.")
     end_time = time.time()
-    if produtos_ainda_restantes:
+    if produtos_ainda_restantes_geral:
         print(f"Script concluído (parcialmente devido a produtos restantes). Tempo total: {end_time - start_time:.2f} segundos.")
     else:
         print(f"Script de integração concluído. Tempo total: {end_time - start_time:.2f} segundos.")
