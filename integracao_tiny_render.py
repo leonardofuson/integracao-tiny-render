@@ -1222,25 +1222,43 @@ def main():
     else:
         print(f"DEBUG MAIN: Arquivo de progresso não existe antes do processamento")
     
-    # Loop para produtos com controle de lote
+    # Processar todos os produtos em lotes até concluir ou encontrar erro
+    # Removido o break que forçava a saída após o primeiro lote
     produtos_ainda_restantes_geral = True
-    while produtos_ainda_restantes_geral:
-        conn, success_sync_prod_lote, produtos_ainda_restantes_lote = buscar_e_gravar_produtos(conn, TINY_API_V2_TOKEN)
-        if not success_sync_prod_lote:
-            print("Sincronização de produtos falhou ou foi parcial neste lote. Verifique os logs.")
-            # Decide se quer parar tudo ou tentar o próximo lote. Por ora, paramos.
-            produtos_ainda_restantes_geral = False # Para o loop principal de produtos
-            break 
-        if not produtos_ainda_restantes_lote:
-            print("Todos os produtos foram processados.")
-            produtos_ainda_restantes_geral = False # Para o loop principal de produtos
-            break 
-        print("Ainda existem produtos a serem processados na carga completa. O script foi projetado para processar em lotes.")
-        print("Execute o script novamente para continuar o processamento dos produtos restantes.")
-        produtos_ainda_restantes_geral = True # Garante que o log final reflita isso
-        break # Sai do while para permitir que o script termine e seja reexecutado para o próximo lote
+    max_lotes_por_execucao = 10  # Limite de segurança para evitar execuções muito longas
+    lotes_processados = 0
     
-    # Verificar novamente o arquivo de progresso após o processamento
+    while produtos_ainda_restantes_geral and lotes_processados < max_lotes_por_execucao:
+        print(f"Processando lote {lotes_processados + 1} de produtos...")
+        conn, success_sync_prod_lote, produtos_ainda_restantes_lote = buscar_e_gravar_produtos(conn, TINY_API_V2_TOKEN)
+        lotes_processados += 1
+        
+        if not success_sync_prod_lote:
+            print(f"Sincronização de produtos falhou ou foi parcial no lote {lotes_processados}. Verifique os logs.")
+            produtos_ainda_restantes_geral = False  # Para o loop principal de produtos
+            break
+            
+        if not produtos_ainda_restantes_lote:
+            print(f"Todos os produtos foram processados após {lotes_processados} lote(s).")
+            produtos_ainda_restantes_geral = False  # Para o loop principal de produtos
+            break
+            
+        print(f"Lote {lotes_processados} concluído. Ainda existem produtos a serem processados.")
+        
+        # Verificar o arquivo de progresso após cada lote
+        if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
+            try:
+                with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
+                    conteudo = f.read().strip()
+                    print(f"DEBUG MAIN: Conteúdo do arquivo de progresso após lote {lotes_processados}: '{conteudo}'")
+            except Exception as e:
+                print(f"DEBUG MAIN: Erro ao ler arquivo de progresso após lote {lotes_processados}: {e}")
+    
+    # Se atingiu o limite de lotes mas ainda há produtos, avisa o usuário
+    if produtos_ainda_restantes_geral and lotes_processados >= max_lotes_por_execucao:
+        print(f"Atingido o limite de {max_lotes_por_execucao} lotes por execução. Execute o script novamente para continuar.")
+    
+    # Verificar novamente o arquivo de progresso após o processamento completo
     if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
         try:
             with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
