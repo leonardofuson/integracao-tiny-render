@@ -427,12 +427,22 @@ def buscar_e_gravar_categorias(conn, api_token):
     return conn, True
 
 def ler_progresso_paginacao_produtos():
+    pagina_str = ""
     try:
         if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
+            print(f"Arquivo de progresso \'{ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}\' encontrado.")
             with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
-                pagina = int(f.read().strip())
+                pagina_str = f.read().strip()
+                if not pagina_str:
+                    print(f"Arquivo de progresso \'{ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}\' está vazio. Iniciando da página 1.")
+                    return 1
+                pagina = int(pagina_str)
                 print(f"Retomando processamento de produtos da página: {pagina}")
                 return pagina
+        else:
+            print(f"Arquivo de progresso \'{ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}\' NÃO encontrado. Iniciando da página 1.")
+    except ValueError as ve:
+        print(f"Erro ao converter conteúdo do arquivo de progresso para inteiro: {ve}. Conteúdo: \'{pagina_str}\'. Iniciando da página 1.")
     except Exception as e:
         print(f"Erro ao ler progresso de produtos: {e}. Iniciando da página 1.")
     return 1
@@ -481,7 +491,11 @@ def buscar_e_gravar_produtos(conn, api_token):
     print("\n--- Iniciando Sincronização de Produtos ---")
     conn = garantir_conexao(conn)
     if conn is None: return conn, False, False
+    
+    # Verificar se existe arquivo de progresso e ler a página atual
     pagina_atual = ler_progresso_paginacao_produtos()
+    print(f"DEBUG: Valor inicial de pagina_atual lido do arquivo: {pagina_atual}")
+    
     produtos_processados_neste_lote = 0
     paginas_processadas_neste_lote = 0
     todos_produtos_processados_carga_completa = False
@@ -1196,6 +1210,18 @@ def main():
     conn, success_sync_cat = buscar_e_gravar_categorias(conn, TINY_API_V2_TOKEN)
     if not success_sync_cat:
         print("Sincronização de categorias falhou. Verifique os logs.")
+    
+    # Verificar se existe arquivo de progresso e exibir conteúdo
+    if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
+        try:
+            with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
+                conteudo = f.read().strip()
+                print(f"DEBUG MAIN: Conteúdo do arquivo de progresso antes do processamento: '{conteudo}'")
+        except Exception as e:
+            print(f"DEBUG MAIN: Erro ao ler arquivo de progresso para debug: {e}")
+    else:
+        print(f"DEBUG MAIN: Arquivo de progresso não existe antes do processamento")
+    
     # Loop para produtos com controle de lote
     produtos_ainda_restantes_geral = True
     while produtos_ainda_restantes_geral:
@@ -1213,6 +1239,18 @@ def main():
         print("Execute o script novamente para continuar o processamento dos produtos restantes.")
         produtos_ainda_restantes_geral = True # Garante que o log final reflita isso
         break # Sai do while para permitir que o script termine e seja reexecutado para o próximo lote
+    
+    # Verificar novamente o arquivo de progresso após o processamento
+    if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
+        try:
+            with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
+                conteudo = f.read().strip()
+                print(f"DEBUG MAIN: Conteúdo do arquivo de progresso APÓS o processamento: '{conteudo}'")
+        except Exception as e:
+            print(f"DEBUG MAIN: Erro ao ler arquivo de progresso para debug após processamento: {e}")
+    else:
+        print(f"DEBUG MAIN: Arquivo de progresso não existe após o processamento")
+    
     if not produtos_ainda_restantes_geral: # Só executa o restante se todos os produtos foram processados
         conn, success_sync_vend = buscar_e_gravar_vendedores(conn, TINY_API_V2_TOKEN)
         if not success_sync_vend:
