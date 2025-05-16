@@ -49,7 +49,8 @@ CHAVE_PROGRESSO_PAGINACAO_PRODUTOS = "ultima_pagina_produto_processada"
 CHAVE_TIMESTAMP_PRODUTOS = "timestamp_produtos"
 CHAVE_TIMESTAMP_PEDIDOS = "timestamp_pedidos"
 
-# Funções para ler e salvar progresso no banco de dados
+PAGINAS_POR_LOTE_PRODUTOS = 3
+TERMO_PESQUISA_PRODUTOS_CARGA_COMPLETA = "a"
 def ler_progresso_db(conn, chave, valor_padrao=None):
     cursor = None
     try:
@@ -1268,16 +1269,11 @@ def main():
     if not success_sync_cat:
         print("Sincronização de categorias falhou. Verifique os logs.")
     
-    # Verificar se existe arquivo de progresso e exibir conteúdo
-    if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
-        try:
-            with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
-                conteudo = f.read().strip()
-                print(f"DEBUG MAIN: Conteúdo do arquivo de progresso antes do processamento: '{conteudo}'")
-        except Exception as e:
-            print(f"DEBUG MAIN: Erro ao ler arquivo de progresso para debug: {e}")
-    else:
-        print(f"DEBUG MAIN: Arquivo de progresso não existe antes do processamento")
+    print(f"DEBUG MAIN: Lendo progresso inicial do banco...")
+    pagina_debug_inicio = ler_progresso_db(conn, CHAVE_PROGRESSO_PAGINACAO_PRODUTOS, "N/A")
+    print(f"DEBUG MAIN: Progresso de paginação de produtos no banco ANTES do processamento: {pagina_debug_inicio}")
+    timestamp_debug_inicio = ler_progresso_db(conn, CHAVE_TIMESTAMP_PRODUTOS, "N/A")
+    print(f"DEBUG MAIN: Timestamp de produtos no banco ANTES do processamento: {timestamp_debug_inicio}")
     
     # Processar todos os produtos em lotes até concluir ou encontrar erro
     # Removido o break que forçava a saída após o primeiro lote
