@@ -329,7 +329,7 @@ def criar_tabela_itens_pedido(conn):
     finally:
         if cursor: cursor.close()
 
-def criar_tabela_controle_progresso(conn):
+def criar_tabela_controdef criar_tabela_controle_progresso(conn):
     cursor = None
     try:
         conn = garantir_conexao(conn)
@@ -337,16 +337,21 @@ def criar_tabela_controle_progresso(conn):
         cursor = conn.cursor()
         create_table_query = """
         CREATE TABLE IF NOT EXISTS controle_progresso (
-            id SERIAL PRIMARY KEY,
-            chave VARCHAR(100) UNIQUE NOT NULL,
+            chave VARCHAR(255) PRIMARY KEY,
             valor TEXT,
             data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
         cursor.execute(create_table_query)
         conn.commit()
-        print("Tabela 'controle_progresso' verificada/criada com sucesso.")
-        return conn, True
+        # Verificar se a tabela foi realmente criada
+        cursor.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'controle_progresso');")
+        if cursor.fetchone()[0]:
+            print("Tabela 'controle_progresso' verificada/criada com sucesso.")
+            return conn, True
+        else:
+            print("ERRO CRÍTICO: Tabela 'controle_progresso' não foi criada após o comando CREATE.")
+            return conn, False
     except (Exception, psycopg2.Error) as error:
         print(f"Erro ao criar tabela 'controle_progresso': {error}")
         if conn and conn.closed == 0: 
@@ -354,7 +359,7 @@ def criar_tabela_controle_progresso(conn):
             except psycopg2.Error as rb_error: print(f"Erro no rollback de controle_progresso: {rb_error}")
         return conn, False
     finally:
-        if cursor: cursor.close()
+        if cursor: cursor.close(): cursor.close()
 
 def format_date_to_db(date_str):
     if not date_str: return None
@@ -1261,8 +1266,9 @@ def main():
     conn, success_vend_tbl = criar_tabela_vendedores(conn)
     conn, success_ped_tbl = criar_tabela_pedidos(conn)
     conn, success_item_ped_tbl = criar_tabela_itens_pedido(conn)
-    if not (success_cat_tbl and success_prod_tbl and success_vend_tbl and success_ped_tbl and success_item_ped_tbl):
-        print("Falha ao criar uma ou mais tabelas. Verifique os logs. Abortando script.")
+    conn, success_ctrl_tbl = criar_tabela_controle_progresso(conn) # Adicionado aqui
+    if not (success_cat_tbl and success_prod_tbl and success_vend_tbl and success_ped_tbl and success_item_ped_tbl and success_ctrl_tbl):
+        print("Falha ao criar uma ou mais tabelas (incluindo controle_progresso). Verifique os logs. Abortando script.")
         if conn and conn.closed == 0: conn.close()
         return
     conn, success_sync_cat = buscar_e_gravar_categorias(conn, TINY_API_V2_TOKEN)
