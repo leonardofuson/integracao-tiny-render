@@ -36,7 +36,7 @@ logger = logging.getLogger()
 TINY_CLIENT_ID = os.environ.get('TINY_CLIENT_ID', 'tiny-api-ee17d9942b165a619fe8159e6ea9cb36c3c1f910-1746017060')
 TINY_CLIENT_SECRET = os.environ.get('TINY_CLIENT_SECRET', 'pYfsuNVKEUqr4hUT6AoQmo0GaFuLXzLI')
 TINY_REDIRECT_URI = os.environ.get('TINY_REDIRECT_URI', 'https://localhost/')
-TINY_AUTH_CODE = os.environ.get('TINY_AUTH_CODE', 'c1c997ac-37be-43fd-9003-5d59e0742e61.f93005b9-5c9c-4639-b228-8f4176c5f461.adc8bb57-389a-48cc-86de-518c71da8e07')
+TINY_AUTH_CODE = os.environ.get('TINY_AUTH_CODE', '1d3331a6-b2e7-4edc-8976-f4af02d9ff3a.f93005b9-5c9c-4639-b228-8f4176c5f461.adc8bb57-389a-48cc-86de-518c71da8e07')
 TINY_API_BASE_URL = 'https://api.tiny.com.br/public-api/v3'
 TINY_TOKEN_URL = 'https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token'
 
