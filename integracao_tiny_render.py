@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script de Integração Tiny ERP -> PostgreSQL (API v3)
+Script de Integração Tiny ERP -> PostgreSQL (API v3 com OAuth 2.0)
 Desenvolvido para Fusion
 
 Este script realiza a sincronização de dados entre o Tiny ERP e um banco de dados PostgreSQL,
-utilizando a API v3 do Tiny. Ele suporta sincronização incremental para produtos e pedidos,
-e carga completa para categorias e vendedores.
+utilizando a API v3 do Tiny com autenticação OAuth 2.0. Ele suporta sincronização incremental 
+para produtos e pedidos, e carga completa para categorias e vendedores.
 
-Todas as informações de progresso são armazenadas no banco de dados PostgreSQL para
+Todas as informações de progresso e tokens são armazenadas no banco de dados PostgreSQL para
 garantir a continuidade mesmo em ambientes efêmeros como o Render.
 """
 
@@ -32,9 +32,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger()
 
-# Configurações da API Tiny
-TINY_TOKEN = os.environ.get('TINY_TOKEN', 'seu_token_aqui')
+# Configurações da API Tiny OAuth 2.0
+TINY_CLIENT_ID = os.environ.get('TINY_CLIENT_ID', 'tiny-api-ee17d9942b165a619fe8159e6ea9cb36c3c1f910-1746017060')
+TINY_CLIENT_SECRET = os.environ.get('TINY_CLIENT_SECRET', 'pYfsuNVKEUqr4hUT6AoQmo0GaFuLXzLI')
+TINY_REDIRECT_URI = os.environ.get('TINY_REDIRECT_URI', 'https://localhost/')
+TINY_AUTH_CODE = os.environ.get('TINY_AUTH_CODE', 'c1c997ac-37be-43fd-9003-5d59e0742e61.f93005b9-5c9c-4639-b228-8f4176c5f461.adc8bb57-389a-48cc-86de-518c71da8e07')
 TINY_API_BASE_URL = 'https://api.tiny.com.br/public-api/v3'
+TINY_TOKEN_URL = 'https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token'
+
+# Chaves para a tabela de controle_progresso (tokens OAuth)
+CHAVE_ACCESS_TOKEN = 'tiny_access_token'
+CHAVE_REFRESH_TOKEN = 'tiny_refresh_token'
+CHAVE_TOKEN_EXPIRY = 'tiny_token_expiry'
+CHAVE_INITIAL_SETUP = 'tiny_oauth_initial_setup'
 
 # Configurações do PostgreSQL
 DB_HOST = os.environ.get('DB_HOST', 'dpg-d0h4vjgdl3ps73cihsv0-a.oregon-postgres.render.com')
@@ -43,7 +53,7 @@ DB_USER = os.environ.get('DB_USER', 'banco_tiny_fusion_user')
 DB_PASSWORD = os.environ.get('DB_PASSWORD', '9JFbOUjBU1f3tM10EZygXgtOp8vKoUyb')
 DB_PORT = os.environ.get('DB_PORT', '5432')
 
-# Chaves para a tabela de controle_progresso
+# Chaves para a tabela de controle_progresso (sincronização)
 CHAVE_PAGINA_PRODUTOS = 'ultima_pagina_produto_processada'
 CHAVE_TIMESTAMP_PRODUTOS = 'timestamp_sincronizacao_produtos'
 CHAVE_PAGINA_PEDIDOS = 'ultima_pagina_pedido_processada'
@@ -178,6 +188,155 @@ def salvar_valor_no_banco(conn, chave, valor):
         if conn and conn.closed == 0:
             conn.rollback()
         return False
+
+# Funções de autenticação OAuth 2.0
+def obter_tokens_iniciais(conn):
+    """
+    Obtém os tokens iniciais usando o código de autorização.
+    
+    Args:
+        conn: Conexão com o banco de dados
+        
+    Returns:
+        True se sucesso, False caso contrário
+    """
+    try:
+        # Verificar se a configuração inicial já foi feita
+        setup_feito = ler_valor_do_banco(conn, CHAVE_INITIAL_SETUP, "false")
+        
+        if setup_feito.lower() == "true":
+            logger.info("Configuração inicial OAuth já foi realizada. Verificando tokens existentes.")
+            return True
+        
+        logger.info("Realizando configuração inicial OAuth 2.0...")
+        
+        # Preparar dados para a requisição de token
+        data = {
+            'grant_type': 'authorization_code',
+            'client_id': TINY_CLIENT_ID,
+            'client_secret': TINY_CLIENT_SECRET,
+            'redirect_uri': TINY_REDIRECT_URI,
+            'code': TINY_AUTH_CODE
+        }
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        # Fazer requisição para obter tokens
+        response = requests.post(TINY_TOKEN_URL, data=data, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Erro ao obter tokens iniciais: {response.status_code} - {response.text}")
+            return False
+        
+        # Extrair tokens da resposta
+        token_data = response.json()
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+        expires_in = token_data.get('expires_in', 3600)  # Padrão: 1 hora
+        
+        if not access_token or not refresh_token:
+            logger.error("Tokens não encontrados na resposta.")
+            return False
+        
+        # Calcular data de expiração
+        expiry_time = datetime.datetime.now() + datetime.timedelta(seconds=expires_in)
+        expiry_str = expiry_time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Salvar tokens no banco
+        salvar_valor_no_banco(conn, CHAVE_ACCESS_TOKEN, access_token)
+        salvar_valor_no_banco(conn, CHAVE_REFRESH_TOKEN, refresh_token)
+        salvar_valor_no_banco(conn, CHAVE_TOKEN_EXPIRY, expiry_str)
+        salvar_valor_no_banco(conn, CHAVE_INITIAL_SETUP, "true")
+        
+        logger.info("Tokens OAuth 2.0 obtidos e salvos com sucesso.")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao obter tokens iniciais: {e}")
+        return False
+
+def renovar_token_se_necessario(conn):
+    """
+    Verifica se o token de acesso expirou e o renova se necessário.
+    
+    Args:
+        conn: Conexão com o banco de dados
+        
+    Returns:
+        Tupla (sucesso, access_token) com indicador de sucesso e token de acesso
+    """
+    try:
+        # Ler tokens e data de expiração do banco
+        access_token = ler_valor_do_banco(conn, CHAVE_ACCESS_TOKEN, "")
+        refresh_token = ler_valor_do_banco(conn, CHAVE_REFRESH_TOKEN, "")
+        expiry_str = ler_valor_do_banco(conn, CHAVE_TOKEN_EXPIRY, "")
+        
+        if not access_token or not refresh_token:
+            logger.error("Tokens OAuth não encontrados no banco.")
+            return False, None
+        
+        # Verificar se o token expirou
+        if expiry_str:
+            try:
+                expiry_time = datetime.datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
+                now = datetime.datetime.now()
+                
+                # Se o token ainda é válido, retorná-lo
+                if now < expiry_time:
+                    logger.info("Token de acesso ainda é válido.")
+                    return True, access_token
+                
+                logger.info("Token de acesso expirou. Renovando...")
+            except Exception as e:
+                logger.error(f"Erro ao processar data de expiração: {e}")
+                # Continuar com a renovação por segurança
+        
+        # Renovar o token usando refresh_token
+        data = {
+            'grant_type': 'refresh_token',
+            'client_id': TINY_CLIENT_ID,
+            'client_secret': TINY_CLIENT_SECRET,
+            'refresh_token': refresh_token
+        }
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        # Fazer requisição para renovar token
+        response = requests.post(TINY_TOKEN_URL, data=data, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Erro ao renovar token: {response.status_code} - {response.text}")
+            return False, None
+        
+        # Extrair novos tokens da resposta
+        token_data = response.json()
+        new_access_token = token_data.get('access_token')
+        new_refresh_token = token_data.get('refresh_token', refresh_token)  # Usar o antigo se não vier um novo
+        expires_in = token_data.get('expires_in', 3600)  # Padrão: 1 hora
+        
+        if not new_access_token:
+            logger.error("Novo token de acesso não encontrado na resposta.")
+            return False, None
+        
+        # Calcular nova data de expiração
+        expiry_time = datetime.datetime.now() + datetime.timedelta(seconds=expires_in)
+        expiry_str = expiry_time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Salvar novos tokens no banco
+        salvar_valor_no_banco(conn, CHAVE_ACCESS_TOKEN, new_access_token)
+        salvar_valor_no_banco(conn, CHAVE_REFRESH_TOKEN, new_refresh_token)
+        salvar_valor_no_banco(conn, CHAVE_TOKEN_EXPIRY, expiry_str)
+        
+        logger.info("Token OAuth 2.0 renovado com sucesso.")
+        return True, new_access_token
+        
+    except Exception as e:
+        logger.error(f"Erro ao renovar token: {e}")
+        return False, None
 
 # Funções de criação de tabelas de dados
 def verificar_e_limpar_constraints_inconsistentes(conn):
@@ -485,11 +644,12 @@ def criar_tabelas_dados(conn):
         return conn, False
 
 # Funções de comunicação com a API do Tiny
-def fazer_requisicao_api(url, params=None, max_tentativas=MAX_TENTATIVAS_API, tempo_espera=TEMPO_ESPERA_ENTRE_TENTATIVAS):
+def fazer_requisicao_api(conn, url, params=None, max_tentativas=MAX_TENTATIVAS_API, tempo_espera=TEMPO_ESPERA_ENTRE_TENTATIVAS):
     """
     Faz uma requisição à API do Tiny com retry em caso de falha.
     
     Args:
+        conn: Conexão com o banco de dados
         url: URL da requisição
         params: Parâmetros da requisição
         max_tentativas: Número máximo de tentativas
@@ -498,9 +658,16 @@ def fazer_requisicao_api(url, params=None, max_tentativas=MAX_TENTATIVAS_API, te
     Returns:
         Resposta da API ou None em caso de falha
     """
+    # Renovar token se necessário
+    sucesso, access_token = renovar_token_se_necessario(conn)
+    
+    if not sucesso or not access_token:
+        logger.error("Falha ao obter token de acesso válido.")
+        raise Exception("Falha ao obter token de acesso válido.")
+    
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {TINY_TOKEN}'
+        'Authorization': f'Bearer {access_token}'
     }
     
     params = params or {}
@@ -517,6 +684,18 @@ def fazer_requisicao_api(url, params=None, max_tentativas=MAX_TENTATIVAS_API, te
             
         except requests.exceptions.RequestException as e:
             logger.warning(f"Tentativa {tentativa}/{max_tentativas} falhou: {e}")
+            
+            # Se for erro 401 (Unauthorized), tentar renovar o token
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
+                logger.info("Erro 401 Unauthorized. Tentando renovar o token...")
+                sucesso, access_token = renovar_token_se_necessario(conn)
+                
+                if sucesso and access_token:
+                    headers['Authorization'] = f'Bearer {access_token}'
+                    logger.info("Token renovado. Tentando novamente...")
+                else:
+                    logger.error("Falha ao renovar o token.")
+            
             if tentativa < max_tentativas:
                 logger.info(f"Aguardando {tempo_espera}s antes de tentar novamente...")
                 time.sleep(tempo_espera)
@@ -570,7 +749,7 @@ def sincronizar_categorias(conn):
         url = f"{TINY_API_BASE_URL}/categorias/todas"
         
         try:
-            resposta = fazer_requisicao_api(url)
+            resposta = fazer_requisicao_api(conn, url)
             
             if not resposta or 'data' not in resposta:
                 logger.error(f"Resposta inválida da API: {resposta}")
@@ -682,7 +861,7 @@ def sincronizar_produtos_incremental(conn, timestamp, lote=1, max_lotes=MAX_LOTE
         }
         
         try:
-            resposta = fazer_requisicao_api(url, params)
+            resposta = fazer_requisicao_api(conn, url, params)
             
             if not resposta or 'data' not in resposta:
                 logger.error(f"Resposta inválida da API: {resposta}")
@@ -742,7 +921,7 @@ def sincronizar_produtos_completo(conn, offset=0, lote=1, max_lotes=MAX_LOTES_PO
         }
         
         try:
-            resposta = fazer_requisicao_api(url, params)
+            resposta = fazer_requisicao_api(conn, url, params)
             
             if not resposta or 'data' not in resposta:
                 logger.error(f"Resposta inválida da API: {resposta}")
@@ -931,7 +1110,7 @@ def sincronizar_vendedores(conn):
             }
             
             try:
-                resposta = fazer_requisicao_api(url, params)
+                resposta = fazer_requisicao_api(conn, url, params)
                 
                 if not resposta or 'data' not in resposta:
                     logger.error(f"Resposta inválida da API: {resposta}")
@@ -1100,7 +1279,7 @@ def sincronizar_pedidos_incremental(conn, timestamp, lote=1, max_lotes=MAX_LOTES
         }
         
         try:
-            resposta = fazer_requisicao_api(url, params)
+            resposta = fazer_requisicao_api(conn, url, params)
             
             if not resposta or 'data' not in resposta:
                 logger.error(f"Resposta inválida da API: {resposta}")
@@ -1160,7 +1339,7 @@ def sincronizar_pedidos_completo(conn, offset=0, lote=1, max_lotes=MAX_LOTES_POR
         }
         
         try:
-            resposta = fazer_requisicao_api(url, params)
+            resposta = fazer_requisicao_api(conn, url, params)
             
             if not resposta or 'data' not in resposta:
                 logger.error(f"Resposta inválida da API: {resposta}")
@@ -1250,7 +1429,7 @@ def processar_pedidos(conn, pedidos):
                 url = f"{TINY_API_BASE_URL}/pedidos/{id_pedido}"
                 
                 try:
-                    resposta_detalhes = fazer_requisicao_api(url)
+                    resposta_detalhes = fazer_requisicao_api(conn, url)
                     
                     if not resposta_detalhes or 'data' not in resposta_detalhes:
                         logger.error(f"Resposta inválida da API para detalhes do pedido {id_pedido}: {resposta_detalhes}")
@@ -1402,7 +1581,7 @@ def main():
     Função principal que coordena a sincronização de dados.
     """
     tempo_inicio = time.time()
-    logger.info("Iniciando script de integração Tiny ERP -> PostgreSQL...")
+    logger.info("Iniciando script de integração Tiny ERP -> PostgreSQL com OAuth 2.0...")
     
     # Conectar ao banco de dados
     conn = conectar_db()
@@ -1415,6 +1594,11 @@ def main():
         conn, sucesso_controle = criar_tabela_controle_progresso(conn)
         if not sucesso_controle:
             logger.error("Falha ao criar tabela de controle de progresso. Encerrando script.")
+            return
+        
+        # Configurar autenticação OAuth 2.0
+        if not obter_tokens_iniciais(conn):
+            logger.error("Falha na configuração inicial OAuth 2.0. Encerrando script.")
             return
         
         # Criar tabelas de dados
