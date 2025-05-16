@@ -199,10 +199,154 @@ def salvar_progresso_db(conn, chave, valor):
         if cursor: 
             cursor.close()
 
+# --- Funções de Limpeza e Verificação de Tabelas ---
+
+def verificar_e_limpar_constraints(conn):
+    """Verifica e limpa constraints conflitantes antes de criar as tabelas."""
+    cursor = None
+    try:
+        conn = garantir_conexao(conn)
+        if conn is None: 
+            logger.error("Falha ao garantir conexão para verificar constraints")
+            return conn, False
+        
+        cursor = conn.cursor()
+        
+        # Verificar constraints existentes
+        logger.info("Verificando constraints existentes...")
+        cursor.execute("""
+        SELECT tc.constraint_name, tc.table_name, kcu.column_name, 
+               ccu.table_name AS foreign_table_name,
+               ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints AS tc 
+        JOIN information_schema.key_column_usage AS kcu
+          ON tc.constraint_name = kcu.constraint_name
+        LEFT JOIN information_schema.constraint_column_usage AS ccu
+          ON ccu.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY';
+        """)
+        
+        constraints = cursor.fetchall()
+        constraints_problematicas = []
+        
+        # Identificar constraints problemáticas (com nomes de coluna inconsistentes)
+        for constraint in constraints:
+            constraint_name, table_name, column_name, foreign_table, foreign_column = constraint
+            
+            # Verificar se há inconsistência entre id_vendedor e id_vendedor_tiny
+            if (table_name == 'pedidos' and column_name == 'id_vendedor' and 
+                foreign_table == 'vendedores' and foreign_column == 'id_vendedor_tiny'):
+                constraints_problematicas.append(constraint_name)
+                logger.warning(f"Constraint inconsistente encontrada: {constraint_name} ({table_name}.{column_name} -> {foreign_table}.{foreign_column})")
+        
+        # Remover constraints problemáticas
+        if constraints_problematicas:
+            logger.info(f"Removendo {len(constraints_problematicas)} constraints inconsistentes...")
+            for constraint_name in constraints_problematicas:
+                logger.info(f"Removendo constraint: {constraint_name}")
+                cursor.execute(f"ALTER TABLE pedidos DROP CONSTRAINT IF EXISTS {constraint_name};")
+            
+            conn.commit()
+            logger.info("Constraints inconsistentes removidas com sucesso.")
+        else:
+            logger.info("Nenhuma constraint inconsistente encontrada.")
+        
+        return conn, True
+    except (Exception, psycopg2.Error) as error:
+        logger.error(f"Erro ao verificar/limpar constraints: {error}")
+        if conn and conn.closed == 0:
+            try:
+                conn.rollback()
+                logger.info("Rollback da transação de verificação de constraints realizado.")
+            except Exception as e:
+                logger.error(f"Erro ao tentar rollback em verificar_e_limpar_constraints: {e}")
+        return conn, False
+    finally:
+        if cursor: 
+            cursor.close()
+
+def verificar_e_corrigir_colunas_pedidos(conn):
+    """Verifica e corrige a coluna id_vendedor para id_vendedor_tiny na tabela pedidos."""
+    cursor = None
+    try:
+        conn = garantir_conexao(conn)
+        if conn is None: 
+            logger.error("Falha ao garantir conexão para verificar colunas da tabela pedidos")
+            return conn, False
+        
+        cursor = conn.cursor()
+        
+        # Verificar se a tabela pedidos existe
+        cursor.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'pedidos');")
+        tabela_existe = cursor.fetchone()[0]
+        
+        if not tabela_existe:
+            logger.info("Tabela 'pedidos' não existe. Nenhuma correção necessária.")
+            return conn, True
+        
+        # Verificar se a coluna id_vendedor existe e id_vendedor_tiny não existe
+        cursor.execute("""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'pedidos' AND column_name IN ('id_vendedor', 'id_vendedor_tiny');
+        """)
+        
+        colunas = [col[0] for col in cursor.fetchall()]
+        
+        if 'id_vendedor' in colunas and 'id_vendedor_tiny' not in colunas:
+            logger.warning("Coluna inconsistente encontrada: 'id_vendedor' em vez de 'id_vendedor_tiny'")
+            logger.info("Renomeando coluna 'id_vendedor' para 'id_vendedor_tiny'...")
+            
+            # Remover constraints primeiro
+            cursor.execute("""
+            SELECT constraint_name
+            FROM information_schema.table_constraints
+            WHERE table_name = 'pedidos' AND constraint_type = 'FOREIGN KEY';
+            """)
+            
+            constraints = [con[0] for con in cursor.fetchall()]
+            for constraint in constraints:
+                cursor.execute(f"ALTER TABLE pedidos DROP CONSTRAINT IF EXISTS {constraint};")
+            
+            # Renomear a coluna
+            cursor.execute("ALTER TABLE pedidos RENAME COLUMN id_vendedor TO id_vendedor_tiny;")
+            
+            conn.commit()
+            logger.info("Coluna renomeada com sucesso.")
+        elif 'id_vendedor_tiny' in colunas:
+            logger.info("Coluna 'id_vendedor_tiny' já existe na tabela 'pedidos'. Nenhuma correção necessária.")
+        else:
+            logger.info("Nenhuma das colunas 'id_vendedor' ou 'id_vendedor_tiny' encontrada. A tabela será recriada.")
+        
+        return conn, True
+    except (Exception, psycopg2.Error) as error:
+        logger.error(f"Erro ao verificar/corrigir colunas da tabela pedidos: {error}")
+        if conn and conn.closed == 0:
+            try:
+                conn.rollback()
+                logger.info("Rollback da transação de verificação de colunas realizado.")
+            except Exception as e:
+                logger.error(f"Erro ao tentar rollback em verificar_e_corrigir_colunas_pedidos: {e}")
+        return conn, False
+    finally:
+        if cursor: 
+            cursor.close()
+
 # --- Funções de Criação de Tabelas de Dados ---
 
 def criar_tabelas_dados(conn):
     """Cria todas as tabelas de dados (categorias, produtos, etc.) se não existirem."""
+    # Primeiro, verificar e limpar constraints problemáticas
+    conn, sucesso_limpeza = verificar_e_limpar_constraints(conn)
+    if not sucesso_limpeza:
+        logger.error("Falha ao limpar constraints problemáticas. Continuando mesmo assim...")
+    
+    # Verificar e corrigir colunas da tabela pedidos
+    conn, sucesso_correcao = verificar_e_corrigir_colunas_pedidos(conn)
+    if not sucesso_correcao:
+        logger.error("Falha ao corrigir colunas da tabela pedidos. Continuando mesmo assim...")
+    
+    # Criar as tabelas na ordem correta
     sucesso_total = True
     tabelas_a_criar = [
         criar_tabela_categorias,
