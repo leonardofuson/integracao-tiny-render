@@ -44,15 +44,57 @@ DB_RECONNECT_DELAY_SECONDS = 10
 PAUSA_ENTRE_CHAMADAS_DETALHE = 0.5 
 PAUSA_ENTRE_PAGINAS = 1.0      
 
-# Arquivo para guardar o progresso da paginação da carga completa de produtos
-ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS = "ultima_pagina_produto_processada.txt"
-PAGINAS_POR_LOTE_PRODUTOS = 3  # Quantas páginas de produtos processar por execução do lote na carga completa
+# Constantes para chaves de controle de progresso no banco
+CHAVE_PROGRESSO_PAGINACAO_PRODUTOS = "ultima_pagina_produto_processada"
+CHAVE_TIMESTAMP_PRODUTOS = "timestamp_produtos"
+CHAVE_TIMESTAMP_PEDIDOS = "timestamp_pedidos"
 
-# Arquivos para guardar os timestamps da última sincronização incremental bem-sucedida
-ARQUIVO_TIMESTAMP_PRODUTOS = "progresso_produtos_timestamp.txt"
-ARQUIVO_TIMESTAMP_PEDIDOS = "progresso_pedidos_timestamp.txt"
+# Funções para ler e salvar progresso no banco de dados
+def ler_progresso_db(conn, chave, valor_padrao=None):
+    cursor = None
+    try:
+        conn = garantir_conexao(conn)
+        if conn is None: return valor_padrao
+        cursor = conn.cursor()
+        cursor.execute("SELECT valor FROM controle_progresso WHERE chave = %s", (chave,))
+        resultado = cursor.fetchone()
+        if resultado:
+            valor = resultado[0]
+            print(f"Valor '{valor}' lido do banco para a chave '{chave}'")
+            return valor
+        else:
+            print(f"Chave '{chave}' não encontrada no banco. Usando valor padrão: {valor_padrao}")
+            return valor_padrao
+    except Exception as e:
+        print(f"Erro ao ler progresso do banco para chave '{chave}': {e}. Usando valor padrão: {valor_padrao}")
+        return valor_padrao
+    finally:
+        if cursor: cursor.close()
 
-TERMO_PESQUISA_PRODUTOS_CARGA_COMPLETA = "a" 
+def salvar_progresso_db(conn, chave, valor):
+    cursor = None
+    try:
+        conn = garantir_conexao(conn)
+        if conn is None: return False
+        cursor = conn.cursor()
+        # Usar UPSERT (INSERT ... ON CONFLICT DO UPDATE) para inserir ou atualizar
+        cursor.execute("""
+            INSERT INTO controle_progresso (chave, valor, data_atualizacao) 
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (chave) 
+            DO UPDATE SET valor = %s, data_atualizacao = CURRENT_TIMESTAMP
+        """, (chave, str(valor), str(valor)))
+        conn.commit()
+        print(f"Progresso salvo no banco: chave='{chave}', valor='{valor}'")
+        return True
+    except Exception as e:
+        print(f"Erro ao salvar progresso no banco para chave '{chave}': {e}")
+        if conn and conn.closed == 0:
+            try: conn.rollback()
+            except: pass
+        return False
+    finally:
+        if cursor: cursor.close()
 
 def conectar_db(attempt=1):
     conn = None
@@ -84,27 +126,25 @@ def garantir_conexao(conn):
         conn = conectar_db()
     return conn
 
-def ler_timestamp_progresso(arquivo_timestamp):
-    try:
-        if os.path.exists(arquivo_timestamp):
-            with open(arquivo_timestamp, "r") as f:
-                timestamp_str = f.read().strip()
-                if timestamp_str:
-                    dt_obj = datetime.strptime(timestamp_str, "%d/%m/%Y %H:%M:%S")
-                    print(f"Timestamp lido de {arquivo_timestamp}: {timestamp_str}")
-                    return timestamp_str 
-    except Exception as e:
-        print(f"Erro ao ler timestamp de {arquivo_timestamp}: {e}. Considernado como não existente.")
+def ler_timestamp_progresso_db(conn, chave):
+    """Lê o timestamp de progresso do banco de dados."""
+    timestamp_str = ler_progresso_db(conn, chave)
+    if timestamp_str:
+        try:
+            dt_obj = datetime.strptime(timestamp_str, "%d/%m/%Y %H:%M:%S")
+            print(f"Timestamp lido do banco para a chave '{chave}': {timestamp_str}")
+            return timestamp_str
+        except ValueError as e:
+            print(f"Erro ao converter timestamp do banco: {e}. Valor: '{timestamp_str}'")
     return None
 
-def salvar_timestamp_progresso(arquivo_timestamp, timestamp_dt_obj):
-    try:
-        timestamp_str = timestamp_dt_obj.strftime("%d/%m/%Y %H:%M:%S")
-        with open(arquivo_timestamp, "w") as f:
-            f.write(timestamp_str)
-        print(f"Timestamp salvo em {arquivo_timestamp}: {timestamp_str}")
-    except Exception as e:
-        print(f"Erro ao salvar timestamp em {arquivo_timestamp}: {e}")
+def salvar_timestamp_progresso_db(conn, chave, timestamp_dt_obj):
+    """Salva o timestamp de progresso no banco de dados."""
+    timestamp_str = timestamp_dt_obj.strftime("%d/%m/%Y %H:%M:%S")
+    resultado = salvar_progresso_db(conn, chave, timestamp_str)
+    if resultado:
+        print(f"Timestamp salvo no banco para a chave '{chave}': {timestamp_str}")
+    return resultado
 
 def criar_tabela_categorias(conn):
     cursor = None
@@ -288,6 +328,33 @@ def criar_tabela_itens_pedido(conn):
     finally:
         if cursor: cursor.close()
 
+def criar_tabela_controle_progresso(conn):
+    cursor = None
+    try:
+        conn = garantir_conexao(conn)
+        if conn is None: return conn, False
+        cursor = conn.cursor()
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS controle_progresso (
+            id SERIAL PRIMARY KEY,
+            chave VARCHAR(100) UNIQUE NOT NULL,
+            valor TEXT,
+            data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        cursor.execute(create_table_query)
+        conn.commit()
+        print("Tabela 'controle_progresso' verificada/criada com sucesso.")
+        return conn, True
+    except (Exception, psycopg2.Error) as error:
+        print(f"Erro ao criar tabela 'controle_progresso': {error}")
+        if conn and conn.closed == 0: 
+            try: conn.rollback(); print("Rollback da transação da tabela controle_progresso realizado.")
+            except psycopg2.Error as rb_error: print(f"Erro no rollback de controle_progresso: {rb_error}")
+        return conn, False
+    finally:
+        if cursor: cursor.close()
+
 def format_date_to_db(date_str):
     if not date_str: return None
     try: return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
@@ -426,44 +493,34 @@ def buscar_e_gravar_categorias(conn, api_token):
     time.sleep(PAUSA_ENTRE_PAGINAS)
     return conn, True
 
-def ler_progresso_paginacao_produtos():
-    pagina_str = ""
+def ler_progresso_paginacao_produtos(conn):
+    """Lê o progresso da paginação de produtos do banco de dados."""
+    valor_str = ler_progresso_db(conn, CHAVE_PROGRESSO_PAGINACAO_PRODUTOS)
+    if valor_str is None:
+        print("Nenhum progresso de paginação de produtos encontrado no banco. Iniciando da página 1.")
+        return 1
+    
     try:
-        if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
-            print(f"Arquivo de progresso \'{ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}\' encontrado.")
-            with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "r") as f:
-                pagina_str = f.read().strip()
-                if not pagina_str:
-                    print(f"Arquivo de progresso \'{ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}\' está vazio. Iniciando da página 1.")
-                    return 1
-                pagina = int(pagina_str)
-                print(f"Retomando processamento de produtos da página: {pagina}")
-                return pagina
-        else:
-            print(f"Arquivo de progresso \'{ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}\' NÃO encontrado. Iniciando da página 1.")
+        pagina = int(valor_str)
+        print(f"Retomando processamento de produtos da página: {pagina}")
+        return pagina
     except ValueError as ve:
-        print(f"Erro ao converter conteúdo do arquivo de progresso para inteiro: {ve}. Conteúdo: \'{pagina_str}\'. Iniciando da página 1.")
-    except Exception as e:
-        print(f"Erro ao ler progresso de produtos: {e}. Iniciando da página 1.")
-    return 1
+        print(f"Erro ao converter valor do progresso para inteiro: {ve}. Valor: '{valor_str}'. Iniciando da página 1.")
+        return 1
 
-def salvar_progresso_paginacao_produtos(pagina):
-    try:
-        with open(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS, "w") as f:
-            f.write(str(pagina))
-        print(f"Progresso de produtos salvo: página {pagina}")
-    except Exception as e:
-        print(f"Erro ao salvar progresso de produtos: {e}")
+def salvar_progresso_paginacao_produtos(conn, pagina):
+    """Salva o progresso da paginação de produtos no banco de dados."""
+    resultado = salvar_progresso_db(conn, CHAVE_PROGRESSO_PAGINACAO_PRODUTOS, str(pagina))
+    if resultado:
+        print(f"Progresso de produtos salvo no banco: página {pagina}")
+    return resultado
 
-def resetar_progresso_paginacao_produtos():
-    if os.path.exists(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS):
-        try:
-            os.remove(ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS)
-            print(f"Arquivo de progresso de paginação de produtos ({ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}) removido.")
-        except Exception as e:
-            print(f"Erro ao tentar remover o arquivo de progresso de paginação de produtos: {e}")
-    else:
-        print(f"Arquivo de progresso de paginação de produtos ({ARQUIVO_PROGRESSO_PAGINACAO_PRODUTOS}) não encontrado para remoção.")
+def resetar_progresso_paginacao_produtos(conn):
+    """Remove o registro de progresso da paginação de produtos do banco de dados."""
+    resultado = salvar_progresso_db(conn, CHAVE_PROGRESSO_PAGINACAO_PRODUTOS, "1")
+    if resultado:
+        print("Progresso de paginação de produtos resetado para página 1.")
+    return resultado
 
 def extrair_codigo_erro_api(erros_api):
     """Tenta extrair o código de erro da resposta da API Tiny."""
@@ -492,14 +549,14 @@ def buscar_e_gravar_produtos(conn, api_token):
     conn = garantir_conexao(conn)
     if conn is None: return conn, False, False
     
-    # Verificar se existe arquivo de progresso e ler a página atual
-    pagina_atual = ler_progresso_paginacao_produtos()
-    print(f"DEBUG: Valor inicial de pagina_atual lido do arquivo: {pagina_atual}")
+    # Verificar se existe progresso no banco e ler a página atual
+    pagina_atual = ler_progresso_paginacao_produtos(conn)
+    print(f"DEBUG: Valor inicial de pagina_atual lido do banco: {pagina_atual}")
     
     produtos_processados_neste_lote = 0
     paginas_processadas_neste_lote = 0
     todos_produtos_processados_carga_completa = False
-    ultimo_timestamp_produtos_str = ler_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS)
+    ultimo_timestamp_produtos_str = ler_timestamp_progresso_db(conn, CHAVE_TIMESTAMP_PRODUTOS)
     if ultimo_timestamp_produtos_str:
         print(f"Modo incremental para produtos ativado. Buscando alterações desde: {ultimo_timestamp_produtos_str}")
         endpoint_produtos_alteracoes = f"{TINY_API_V2_BASE_URL}/produtos.pesquisar.alteracoes.php"
@@ -528,8 +585,8 @@ def buscar_e_gravar_produtos(conn, api_token):
                         return conn, False, True 
                 produtos_alterados = retorno_api.get("produtos", [])
                 if not produtos_alterados and pagina_api_incremental == 1:
-                    print("Nenhum produto alterado encontrado desde o último timestamp.")
-                    salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
+                    print(f"Nenhum produto alterado encontrado desde o último timestamp.")
+                    salvar_timestamp_progresso_db(conn, CHAVE_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
                     return conn, True, False 
                 if not produtos_alterados:
                     print("Fim da lista de produtos alterados (página vazia).")
@@ -576,9 +633,9 @@ def buscar_e_gravar_produtos(conn, api_token):
                     try: conn.rollback(); print("Rollback da transação de produtos alterados realizado.")
                     except psycopg2.Error as rb_error: print(f"Erro no rollback de produtos alterados: {rb_error}")
                 return conn, False, True
-        salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
+        salvar_timestamp_progresso_db(conn, CHAVE_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
         print("Sincronização incremental de produtos concluída.")
-        resetar_progresso_paginacao_produtos() 
+        resetar_progresso_paginacao_produtos(conn) 
         return conn, True, False 
     print(f"Modo de carga completa para produtos ativado. Iniciando da página {pagina_atual} com termo '{TERMO_PESQUISA_PRODUTOS_CARGA_COMPLETA}'.")
     endpoint_produtos_lista_completa = f"{TINY_API_V2_BASE_URL}/produtos.pesquisa.php"
@@ -598,21 +655,21 @@ def buscar_e_gravar_produtos(conn, api_token):
                 if codigo_erro in ["22", "23"]:
                     print(f"API de produtos (carga completa): Nenhuma página adicional encontrada (Erro {codigo_erro} na página {pagina_atual}). Todos os produtos foram listados.")
                     todos_produtos_processados_carga_completa = True
-                    resetar_progresso_paginacao_produtos()
-                    salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
-                    print("Carga completa de produtos finalizada. Timestamp salvo.")
+                    resetar_progresso_paginacao_produtos(conn)
+                    salvar_timestamp_progresso_db(conn, CHAVE_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
+                    print("Carga completa de produtos finalizada. Timestamp salvo no banco.")
                     break 
                 else:
                     print(f"Erro da API Tiny ao listar produtos (página {pagina_atual}): {erros}. Código extraído: {codigo_erro}. Resposta completa: {data}")
-                    salvar_progresso_paginacao_produtos(pagina_atual) 
+                    salvar_progresso_paginacao_produtos(conn, pagina_atual) 
                     return conn, False, True 
             produtos_da_pagina = retorno_api.get("produtos", [])
             if not produtos_da_pagina:
                 print(f"Fim da lista de produtos (página {pagina_atual} vazia). Todos os produtos foram listados.")
                 todos_produtos_processados_carga_completa = True
-                resetar_progresso_paginacao_produtos()
-                salvar_timestamp_progresso(ARQUIVO_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
-                print("Carga completa de produtos finalizada (página vazia). Timestamp salvo.")
+                resetar_progresso_paginacao_produtos(conn)
+                salvar_timestamp_progresso_db(conn, CHAVE_TIMESTAMP_PRODUTOS, datetime.now(timezone.utc))
+                print("Carga completa de produtos finalizada (página vazia). Timestamp salvo no banco.")
                 break 
             print(f"Encontrados {len(produtos_da_pagina)} produtos na página {pagina_atual}.")
             commit_needed_for_page = False
@@ -638,11 +695,11 @@ def buscar_e_gravar_produtos(conn, api_token):
                     print(f"Erro ao commitar produtos da página {pagina_atual}: {e}. Tentando rollback...")
                     try: conn.rollback()
                     except psycopg2.Error as rb_err: print(f"Erro no rollback: {rb_err}")
-                    salvar_progresso_paginacao_produtos(pagina_atual)
+                    salvar_progresso_paginacao_produtos(conn, pagina_atual)
                     return conn, False, True
             paginas_processadas_neste_lote += 1
             pagina_atual += 1
-            salvar_progresso_paginacao_produtos(pagina_atual) 
+            salvar_progresso_paginacao_produtos(conn, pagina_atual) 
             time.sleep(PAUSA_ENTRE_PAGINAS)
         except requests.exceptions.RequestException as e:
             print(f"Erro de requisição ao listar produtos (página {pagina_atual}): {e}")
